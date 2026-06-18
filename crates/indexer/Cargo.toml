@@ -1,5 +1,5 @@
-﻿[package]
-name = "ai-file-search-cli"
+[package]
+name = "ai-file-search-indexer"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -11,4 +11,4 @@ workspace = true
 
 [dependencies]
 ai-file-search-core = { path = "../core" }
-ai-file-search-indexer = { path = "../indexer" }
+

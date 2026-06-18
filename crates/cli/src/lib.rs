@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::Path;
 use std::time::Instant;
 
@@ -21,6 +22,7 @@ pub fn run(args: impl IntoIterator<Item = impl AsRef<str>>) -> CliResult {
         Some("index") if args.len() == 3 => index(&args[1], &args[2]),
         Some("query") if args.len() == 3 => query(&args[1], &args[2]),
         Some("bench") if args.len() == 3 => bench(&args[1], &args[2]),
+        Some("fixture") if args.len() == 3 => fixture(&args[1], &args[2]),
         _ => usage_error(),
     }
 }
@@ -141,7 +143,7 @@ fn usage_error() -> CliResult {
     CliResult {
         exit_code: 2,
         stdout: String::new(),
-        stderr: "usage: ai-file-search <search <root> <query>|index <root> <index-file>|query <index-file> <query>|bench <root> <query>>\n".to_owned(),
+        stderr: "usage: ai-file-search <search <root> <query>|index <root> <index-file>|query <index-file> <query>|bench <root> <query>|fixture <root> <count>>\n".to_owned(),
     }
 }
 
@@ -178,6 +180,48 @@ fn bench(root: &str, query: &str) -> CliResult {
             "files={file_count}\nmatches={}\nscan_ms={scan_ms}\nsearch_ms={search_ms}\n",
             matches.len()
         ),
+        stderr: String::new(),
+    }
+}
+
+fn fixture(root: &str, count: &str) -> CliResult {
+    let count = match count.parse::<usize>() {
+        Ok(count) => count,
+        Err(error) => {
+            return CliResult {
+                exit_code: 2,
+                stdout: String::new(),
+                stderr: format!("invalid count: {error}\n"),
+            };
+        }
+    };
+    let root = Path::new(root);
+
+    for index in 0..count {
+        let group = index / 1_000;
+        let directory = root.join(format!("group-{group:03}"));
+        if let Err(error) = fs::create_dir_all(&directory) {
+            return CliResult {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: format!("fixture directory create failed: {error}\n"),
+            };
+        }
+
+        let file_path = directory.join(format!("file-{index:06}.txt"));
+        let contents = format!("fixture file {index:06}\n");
+        if let Err(error) = fs::write(file_path, contents) {
+            return CliResult {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: format!("fixture file write failed: {error}\n"),
+            };
+        }
+    }
+
+    CliResult {
+        exit_code: 0,
+        stdout: format!("generated {count} files\n"),
         stderr: String::new(),
     }
 }

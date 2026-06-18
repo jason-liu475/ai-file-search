@@ -31,7 +31,7 @@ fn missing_arguments_return_usage_error() {
     assert_eq!(result.stdout, "");
     assert_eq!(
         result.stderr,
-        "usage: ai-file-search <search <root> <query>|index <root> <index-file>|query <index-file> <query>|bench <root> <query>>\n"
+        "usage: ai-file-search <search <root> <query>|index <root> <index-file>|query <index-file> <query>|bench <root> <query>|fixture <root> <count>>\n"
     );
 }
 
@@ -108,6 +108,43 @@ fn bench_command_reports_scan_and_search_metrics() {
     assert!(result.stdout.contains("matches=1\n"));
     assert!(result.stdout.contains("scan_ms="));
     assert!(result.stdout.contains("search_ms="));
+}
+
+#[test]
+fn fixture_command_creates_deterministic_files() {
+    let fixture = TestDir::new("fixture_command_creates_deterministic_files");
+    let dataset = fixture.path().join("dataset");
+
+    let result = run([
+        "fixture",
+        dataset.to_str().expect("dataset path should be UTF-8"),
+        "3",
+    ]);
+
+    assert_eq!(result.exit_code, 0);
+    assert_eq!(result.stderr, "");
+    assert_eq!(result.stdout, "generated 3 files\n");
+    assert!(dataset.join("group-000").join("file-000000.txt").exists());
+    assert!(dataset.join("group-000").join("file-000001.txt").exists());
+    assert!(dataset.join("group-000").join("file-000002.txt").exists());
+}
+
+#[test]
+fn fixture_command_rejects_invalid_count() {
+    let fixture = TestDir::new("fixture_command_rejects_invalid_count");
+
+    let result = run([
+        "fixture",
+        fixture
+            .path()
+            .to_str()
+            .expect("fixture path should be UTF-8"),
+        "not-a-number",
+    ]);
+
+    assert_eq!(result.exit_code, 2);
+    assert_eq!(result.stdout, "");
+    assert!(result.stderr.starts_with("invalid count: "));
 }
 
 struct TestDir {

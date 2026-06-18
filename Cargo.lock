@@ -12,3 +12,10 @@ dependencies = [
 [[package]]
 name = "ai-file-search-core"
 version = "0.1.0"
+
+[[package]]
+name = "ai-file-search-indexer"
+version = "0.1.0"
+dependencies = [
+ "ai-file-search-core",
+]

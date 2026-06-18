@@ -31,7 +31,7 @@ fn missing_arguments_return_usage_error() {
     assert_eq!(result.stdout, "");
     assert_eq!(
         result.stderr,
-        "usage: ai-file-search <search <root> <query>|index <root> <index-file>|query <index-file> <query>>\n"
+        "usage: ai-file-search <search <root> <query>|index <root> <index-file>|query <index-file> <query>|bench <root> <query>>\n"
     );
 }
 
@@ -85,6 +85,29 @@ fn query_command_reads_saved_index_file() {
     assert_eq!(query_result.exit_code, 0);
     assert_eq!(query_result.stderr, "");
     assert_eq!(query_result.stdout, "Documents/quarterly-report.pdf\n");
+}
+
+#[test]
+fn bench_command_reports_scan_and_search_metrics() {
+    let fixture = TestDir::new("bench_command_reports_scan_and_search_metrics");
+    fixture.write_file("Documents/quarterly-report.pdf", "report");
+    fixture.write_file("Downloads/archive.zip", "archive");
+
+    let result = run([
+        "bench",
+        fixture
+            .path()
+            .to_str()
+            .expect("fixture path should be UTF-8"),
+        "report",
+    ]);
+
+    assert_eq!(result.exit_code, 0);
+    assert_eq!(result.stderr, "");
+    assert!(result.stdout.contains("files=2\n"));
+    assert!(result.stdout.contains("matches=1\n"));
+    assert!(result.stdout.contains("scan_ms="));
+    assert!(result.stdout.contains("search_ms="));
 }
 
 struct TestDir {

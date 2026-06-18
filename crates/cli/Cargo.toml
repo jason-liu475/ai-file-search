@@ -11,3 +11,4 @@ workspace = true
 
 [dependencies]
 ai-file-search-core = { path = "../core" }
+ai-file-search-indexer = { path = "../indexer" }

@@ -31,8 +31,60 @@ fn missing_arguments_return_usage_error() {
     assert_eq!(result.stdout, "");
     assert_eq!(
         result.stderr,
-        "usage: ai-file-search search <root> <query>\n"
+        "usage: ai-file-search <search <root> <query>|index <root> <index-file>|query <index-file> <query>>\n"
     );
+}
+
+#[test]
+fn index_command_writes_index_file() {
+    let fixture = TestDir::new("index_command_writes_index_file");
+    fixture.write_file("Documents/quarterly-report.pdf", "report");
+    let index_path = fixture.path().join("index.txt");
+
+    let result = run([
+        "index",
+        fixture
+            .path()
+            .to_str()
+            .expect("fixture path should be UTF-8"),
+        index_path.to_str().expect("index path should be UTF-8"),
+    ]);
+
+    assert_eq!(result.exit_code, 0);
+    assert_eq!(result.stderr, "");
+    assert_eq!(result.stdout, "indexed 1 files\n");
+    assert_eq!(
+        fs::read_to_string(index_path).expect("index file should be readable"),
+        "Documents/quarterly-report.pdf\n"
+    );
+}
+
+#[test]
+fn query_command_reads_saved_index_file() {
+    let fixture = TestDir::new("query_command_reads_saved_index_file");
+    fixture.write_file("Documents/quarterly-report.pdf", "report");
+    fixture.write_file("Downloads/archive.zip", "archive");
+    let index_path = fixture.path().join("index.txt");
+
+    let index_result = run([
+        "index",
+        fixture
+            .path()
+            .to_str()
+            .expect("fixture path should be UTF-8"),
+        index_path.to_str().expect("index path should be UTF-8"),
+    ]);
+    assert_eq!(index_result.exit_code, 0);
+
+    let query_result = run([
+        "query",
+        index_path.to_str().expect("index path should be UTF-8"),
+        "report",
+    ]);
+
+    assert_eq!(query_result.exit_code, 0);
+    assert_eq!(query_result.stderr, "");
+    assert_eq!(query_result.stdout, "Documents/quarterly-report.pdf\n");
 }
 
 struct TestDir {

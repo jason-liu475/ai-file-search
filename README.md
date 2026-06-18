@@ -14,7 +14,67 @@ The project starts with a Rust core and a CLI prototype before adding the deskto
 
 ## Current Status
 
-Milestone 1 is being built: Rust workspace, core path model, scanner, index store, search, CLI, and benchmark fixtures.
+Milestone 1 is being built: Rust workspace, core path model, recursive scanner, in-memory index store, file-backed index store, CLI commands, and benchmark fixtures.
+
+The current CLI is usable for local experiments. It is not yet a production desktop app.
+
+## Quick Start
+
+Generate a deterministic fixture dataset:
+
+```bash
+cargo run -p ai-file-search-cli -- fixture ./tmp-fixture 100
+```
+
+Run a scan/search benchmark over that dataset:
+
+```bash
+cargo run -p ai-file-search-cli -- bench ./tmp-fixture file-000042
+```
+
+Build a persistent index file:
+
+```bash
+cargo run -p ai-file-search-cli -- index ./tmp-fixture ./tmp-index.txt
+```
+
+Query the saved index:
+
+```bash
+cargo run -p ai-file-search-cli -- query ./tmp-index.txt file-000042
+```
+
+For one-shot search without saving an index:
+
+```bash
+cargo run -p ai-file-search-cli -- search ./tmp-fixture file-000042
+```
+
+## CLI Commands
+
+```text
+ai-file-search search <root> <query>
+ai-file-search index <root> <index-file>
+ai-file-search query <index-file> <query>
+ai-file-search bench <root> <query>
+ai-file-search fixture <root> <count>
+```
+
+Current behavior:
+
+- `search` scans a root directory and searches file names in memory.
+- `index` scans a root directory and saves normalized relative paths to an index file.
+- `query` searches a previously saved index file.
+- `bench` reports file count, match count, scan time, and search time.
+- `fixture` creates deterministic files for repeatable local benchmarks.
+
+## MVP Limitations
+
+- The persistent store is a simple line-based file, not SQLite or Tantivy yet.
+- Search is file-name substring search only.
+- File watching and incremental updates are not implemented yet.
+- Content indexing is not implemented yet.
+- Desktop UI and AI-facing local API are planned after the CLI/core path is stable.
 
 ## Development
 

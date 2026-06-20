@@ -17,6 +17,8 @@ fn scans_files_directly_under_root() {
         .collect::<Vec<_>>();
 
     assert_eq!(paths, vec!["report.txt"]);
+    assert_eq!(files[0].size_bytes, 16);
+    assert!(files[0].modified_unix_seconds > 0);
 }
 
 #[test]

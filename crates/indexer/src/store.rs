@@ -7,9 +7,51 @@ use ai_file_search_core::PathId;
 
 use crate::IndexedFile;
 
+const INDEX_HEADER: &str = "aifs-index-v1";
+
 #[derive(Clone, Debug, Default)]
 pub struct MemoryIndexStore {
     files: BTreeMap<String, IndexedFile>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RefreshSummary {
+    pub added: usize,
+    pub updated: usize,
+    pub removed: usize,
+    pub unchanged: usize,
+}
+
+impl RefreshSummary {
+    #[must_use]
+    pub fn compare(old_files: &[IndexedFile], new_files: &[IndexedFile]) -> Self {
+        let old_by_path = files_by_path(old_files);
+        let new_by_path = files_by_path(new_files);
+
+        let mut summary = Self::default();
+
+        for (path, new_file) in &new_by_path {
+            match old_by_path.get(path) {
+                Some(old_file) if same_file_metadata(old_file, new_file) => {
+                    summary.unchanged += 1;
+                }
+                Some(_) => {
+                    summary.updated += 1;
+                }
+                None => {
+                    summary.added += 1;
+                }
+            }
+        }
+
+        for path in old_by_path.keys() {
+            if !new_by_path.contains_key(path) {
+                summary.removed += 1;
+            }
+        }
+
+        summary
+    }
 }
 
 impl MemoryIndexStore {
@@ -21,6 +63,13 @@ impl MemoryIndexStore {
     pub fn upsert_file(&mut self, file: IndexedFile) {
         self.files
             .insert(file.relative_path.as_normalized().to_owned(), file);
+    }
+
+    pub fn replace_all(&mut self, files: Vec<IndexedFile>) {
+        self.files.clear();
+        for file in files {
+            self.upsert_file(file);
+        }
     }
 
     pub fn remove_path(&mut self, path: &PathId) {
@@ -42,6 +91,17 @@ impl MemoryIndexStore {
             .cloned()
             .collect()
     }
+}
+
+fn files_by_path(files: &[IndexedFile]) -> BTreeMap<&str, &IndexedFile> {
+    files
+        .iter()
+        .map(|file| (file.relative_path.as_normalized(), file))
+        .collect()
+}
+
+fn same_file_metadata(left: &IndexedFile, right: &IndexedFile) -> bool {
+    left.size_bytes == right.size_bytes && left.modified_unix_seconds == right.modified_unix_seconds
 }
 
 fn file_name(file: &IndexedFile) -> &str {
@@ -70,10 +130,16 @@ impl FileIndexStore {
 
         if path.exists() {
             let contents = fs::read_to_string(path)?;
-            for line in contents.lines().filter(|line| !line.is_empty()) {
-                memory.upsert_file(IndexedFile {
-                    relative_path: PathId::from_user_path(line),
-                });
+            let mut lines = contents.lines();
+            let has_header = lines.next().is_some_and(|line| line == INDEX_HEADER);
+            let records: Box<dyn Iterator<Item = &str> + '_> = if has_header {
+                Box::new(lines)
+            } else {
+                Box::new(contents.lines())
+            };
+
+            for line in records.filter(|line| !line.is_empty()) {
+                memory.upsert_file(parse_index_record(line, has_header));
             }
         }
 
@@ -87,8 +153,17 @@ impl FileIndexStore {
         self.memory.upsert_file(file);
     }
 
+    pub fn replace_all(&mut self, files: Vec<IndexedFile>) {
+        self.memory.replace_all(files);
+    }
+
     pub fn remove_path(&mut self, path: &PathId) {
         self.memory.remove_path(path);
+    }
+
+    #[must_use]
+    pub fn all_files(&self) -> Vec<IndexedFile> {
+        self.memory.all_files()
     }
 
     /// Saves the current index to disk.
@@ -102,22 +177,65 @@ impl FileIndexStore {
             fs::create_dir_all(parent)?;
         }
 
-        let mut contents = self
-            .memory
-            .all_files()
-            .iter()
-            .map(|file| file.relative_path.as_normalized())
-            .collect::<Vec<_>>()
-            .join("\n");
-        if !contents.is_empty() {
-            contents.push('\n');
-        }
+        let mut lines = vec![INDEX_HEADER.to_owned()];
+        lines.extend(self.memory.all_files().iter().map(format_index_record));
 
-        fs::write(&self.path, contents)
+        let mut contents = lines.join("\n");
+        contents.push('\n');
+
+        let temporary_path = temporary_index_path(&self.path);
+        fs::write(&temporary_path, contents)?;
+        fs::rename(temporary_path, &self.path)
     }
 
     #[must_use]
     pub fn search_by_name(&self, query: &str) -> Vec<IndexedFile> {
         self.memory.search_by_name(query)
     }
+}
+
+fn parse_index_record(line: &str, has_header: bool) -> IndexedFile {
+    if has_header {
+        let mut parts = line.splitn(3, '\t');
+        let size_bytes = parts
+            .next()
+            .and_then(|size| size.parse::<u64>().ok())
+            .unwrap_or_default();
+        let modified_unix_seconds = parts
+            .next()
+            .and_then(|size| size.parse::<u64>().ok())
+            .unwrap_or_default();
+        let path = parts.next().unwrap_or_default();
+
+        IndexedFile {
+            relative_path: PathId::from_user_path(path),
+            size_bytes,
+            modified_unix_seconds,
+        }
+    } else {
+        IndexedFile {
+            relative_path: PathId::from_user_path(line),
+            size_bytes: 0,
+            modified_unix_seconds: 0,
+        }
+    }
+}
+
+fn format_index_record(file: &IndexedFile) -> String {
+    [
+        file.size_bytes.to_string(),
+        file.modified_unix_seconds.to_string(),
+        file.relative_path.as_normalized().to_owned(),
+    ]
+    .join("\t")
+}
+
+fn temporary_index_path(path: &Path) -> PathBuf {
+    let mut temporary_path = path.to_owned();
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map_or_else(|| "tmp".to_owned(), |extension| format!("{extension}.tmp"));
+    temporary_path.set_extension(extension);
+    temporary_path
 }

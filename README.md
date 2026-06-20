@@ -38,6 +38,12 @@ Build a persistent index file:
 cargo run -p ai-file-search-cli -- index ./tmp-fixture ./tmp-index.txt
 ```
 
+Refresh a saved index after files change:
+
+```bash
+cargo run -p ai-file-search-cli -- refresh ./tmp-fixture ./tmp-index.txt
+```
+
 Query the saved index:
 
 ```bash
@@ -55,6 +61,7 @@ cargo run -p ai-file-search-cli -- search ./tmp-fixture file-000042
 ```text
 ai-file-search search <root> <query>
 ai-file-search index <root> <index-file>
+ai-file-search refresh <root> <index-file>
 ai-file-search query <index-file> <query>
 ai-file-search bench <root> <query>
 ai-file-search fixture <root> <count>
@@ -63,16 +70,17 @@ ai-file-search fixture <root> <count>
 Current behavior:
 
 - `search` scans a root directory and searches file names in memory.
-- `index` scans a root directory and saves normalized relative paths to an index file.
+- `index` scans a root directory and saves a lightweight local index file with normalized relative paths, file sizes, and modified times.
+- `refresh` rescans a root directory, replaces the saved index, and reports added, updated, removed, and unchanged counts.
 - `query` searches a previously saved index file.
 - `bench` reports file count, match count, scan time, and search time.
 - `fixture` creates deterministic files for repeatable local benchmarks.
 
 ## MVP Limitations
 
-- The persistent store is a simple line-based file, not SQLite or Tantivy yet.
+- The persistent store is a simple versioned text file, not SQLite, Tantivy, or an external database.
 - Search is file-name substring search only.
-- File watching and incremental updates are not implemented yet.
+- File watching and true incremental updates are not implemented yet; `refresh` currently does a full rescan.
 - Content indexing is not implemented yet.
 - Desktop UI and AI-facing local API are planned after the CLI/core path is stable.
 

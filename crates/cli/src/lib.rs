@@ -1,8 +1,11 @@
 use std::fs;
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use ai_file_search_indexer::{FileIndexStore, MemoryIndexStore, ScanOptions, Scanner};
+use ai_file_search_indexer::{
+    FileIndexStore, IndexedFile, MemoryIndexStore, RefreshSummary, ScanOptions, Scanner,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CliResult {
@@ -20,6 +23,7 @@ pub fn run(args: impl IntoIterator<Item = impl AsRef<str>>) -> CliResult {
     match args.first().map(String::as_str) {
         Some("search") if args.len() == 3 => search(&args[1], &args[2]),
         Some("index") if args.len() == 3 => index(&args[1], &args[2]),
+        Some("refresh") if args.len() == 3 => refresh(&args[1], &args[2]),
         Some("query") if args.len() == 3 => query(&args[1], &args[2]),
         Some("bench") if args.len() == 3 => bench(&args[1], &args[2]),
         Some("fixture") if args.len() == 3 => fixture(&args[1], &args[2]),
@@ -98,8 +102,8 @@ fn query(index_path: &str, query: &str) -> CliResult {
 
 fn index(root: &str, index_path: &str) -> CliResult {
     let root = Path::new(root);
-    let scanner = Scanner::new(ScanOptions::default());
-    let files = match scanner.scan(root) {
+    let index_path = Path::new(index_path);
+    let files = match scan_files_for_index(root, index_path) {
         Ok(files) => files,
         Err(error) => {
             return CliResult {
@@ -111,7 +115,7 @@ fn index(root: &str, index_path: &str) -> CliResult {
     };
     let file_count = files.len();
 
-    let mut store = match FileIndexStore::open(Path::new(index_path)) {
+    let mut store = match FileIndexStore::open(index_path) {
         Ok(store) => store,
         Err(error) => {
             return CliResult {
@@ -139,11 +143,78 @@ fn index(root: &str, index_path: &str) -> CliResult {
     }
 }
 
+fn refresh(root: &str, index_path: &str) -> CliResult {
+    let root = Path::new(root);
+    let index_path = Path::new(index_path);
+    let files = match scan_files_for_index(root, index_path) {
+        Ok(files) => files,
+        Err(error) => {
+            return CliResult {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: format!("scan failed: {error}\n"),
+            };
+        }
+    };
+    let file_count = files.len();
+
+    let mut store = match FileIndexStore::open(index_path) {
+        Ok(store) => store,
+        Err(error) => {
+            return CliResult {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: format!("index open failed: {error}\n"),
+            };
+        }
+    };
+    let old_files = store.all_files();
+    let summary = RefreshSummary::compare(&old_files, &files);
+    store.replace_all(files);
+    if let Err(error) = store.save() {
+        return CliResult {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: format!("index save failed: {error}\n"),
+        };
+    }
+
+    CliResult {
+        exit_code: 0,
+        stdout: format!(
+            "refreshed {file_count} files\nadded={}\nupdated={}\nremoved={}\nunchanged={}\n",
+            summary.added, summary.updated, summary.removed, summary.unchanged
+        ),
+        stderr: String::new(),
+    }
+}
+
+fn scan_files_for_index(root: &Path, index_path: &Path) -> io::Result<Vec<IndexedFile>> {
+    let scanner = Scanner::new(ScanOptions::default());
+    let mut files = scanner.scan(root)?;
+
+    if let Some(index_relative_path) = relative_index_path(root, index_path) {
+        files.retain(|file| file.relative_path.as_normalized() != index_relative_path);
+    }
+
+    Ok(files)
+}
+
+fn relative_index_path(root: &Path, index_path: &Path) -> Option<String> {
+    index_path.strip_prefix(root).ok().map(|relative_path| {
+        relative_path
+            .components()
+            .collect::<PathBuf>()
+            .to_string_lossy()
+            .replace('\\', "/")
+    })
+}
+
 fn usage_error() -> CliResult {
     CliResult {
         exit_code: 2,
         stdout: String::new(),
-        stderr: "usage: ai-file-search <search <root> <query>|index <root> <index-file>|query <index-file> <query>|bench <root> <query>|fixture <root> <count>>\n".to_owned(),
+        stderr: "usage: ai-file-search <search <root> <query>|index <root> <index-file>|refresh <root> <index-file>|query <index-file> <query>|bench <root> <query>|fixture <root> <count>>\n".to_owned(),
     }
 }
 

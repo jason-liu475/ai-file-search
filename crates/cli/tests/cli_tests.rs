@@ -31,7 +31,7 @@ fn missing_arguments_return_usage_error() {
     assert_eq!(result.stdout, "");
     assert_eq!(
         result.stderr,
-        "usage: ai-file-search <search <root> <query>|index <root> <index-file>|query <index-file> <query>|bench <root> <query>|fixture <root> <count>>\n"
+        "usage: ai-file-search <search <root> <query>|index <root> <index-file>|refresh <root> <index-file>|query <index-file> <query>|bench <root> <query>|fixture <root> <count>>\n"
     );
 }
 
@@ -53,10 +53,19 @@ fn index_command_writes_index_file() {
     assert_eq!(result.exit_code, 0);
     assert_eq!(result.stderr, "");
     assert_eq!(result.stdout, "indexed 1 files\n");
-    assert_eq!(
-        fs::read_to_string(index_path).expect("index file should be readable"),
-        "Documents/quarterly-report.pdf\n"
+    let index_contents = fs::read_to_string(index_path).expect("index file should be readable");
+    let lines = index_contents.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0], "aifs-index-v1");
+
+    let fields = lines[1].split('\t').collect::<Vec<_>>();
+    assert_eq!(fields.len(), 3);
+    assert_eq!(fields[0], "6");
+    assert!(
+        fields[1].parse::<u64>().expect("mtime should be numeric") > 0,
+        "mtime should be recorded"
     );
+    assert_eq!(fields[2], "Documents/quarterly-report.pdf");
 }
 
 #[test]
@@ -85,6 +94,50 @@ fn query_command_reads_saved_index_file() {
     assert_eq!(query_result.exit_code, 0);
     assert_eq!(query_result.stderr, "");
     assert_eq!(query_result.stdout, "Documents/quarterly-report.pdf\n");
+}
+
+#[test]
+fn refresh_command_removes_stale_paths_from_saved_index() {
+    let fixture = TestDir::new("refresh_command_removes_stale_paths_from_saved_index");
+    fixture.write_file("Documents/quarterly-report.pdf", "report");
+    fixture.write_file("Downloads/archive.zip", "archive");
+    let index_path = fixture.path().join("index.txt");
+
+    let index_result = run([
+        "index",
+        fixture
+            .path()
+            .to_str()
+            .expect("fixture path should be UTF-8"),
+        index_path.to_str().expect("index path should be UTF-8"),
+    ]);
+    assert_eq!(index_result.exit_code, 0);
+
+    fixture.remove_file("Documents/quarterly-report.pdf");
+    let refresh_result = run([
+        "refresh",
+        fixture
+            .path()
+            .to_str()
+            .expect("fixture path should be UTF-8"),
+        index_path.to_str().expect("index path should be UTF-8"),
+    ]);
+    assert_eq!(refresh_result.exit_code, 0);
+    assert_eq!(refresh_result.stderr, "");
+    assert_eq!(
+        refresh_result.stdout,
+        "refreshed 1 files\nadded=0\nupdated=0\nremoved=1\nunchanged=1\n"
+    );
+
+    let stale_query_result = run([
+        "query",
+        index_path.to_str().expect("index path should be UTF-8"),
+        "report",
+    ]);
+
+    assert_eq!(stale_query_result.exit_code, 0);
+    assert_eq!(stale_query_result.stderr, "");
+    assert_eq!(stale_query_result.stdout, "");
 }
 
 #[test]
@@ -174,6 +227,10 @@ impl TestDir {
             fs::create_dir_all(parent).expect("fixture parent directory should be created");
         }
         fs::write(path, contents).expect("fixture file should be written");
+    }
+
+    fn remove_file(&self, relative_path: &str) {
+        fs::remove_file(self.path.join(relative_path)).expect("fixture file should be removed");
     }
 }
 

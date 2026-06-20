@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use ai_file_search_core::PathId;
 
@@ -27,6 +28,8 @@ impl ScanOptions {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexedFile {
     pub relative_path: PathId,
+    pub size_bytes: u64,
+    pub modified_unix_seconds: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -75,15 +78,26 @@ impl Scanner {
                     self.scan_directory(root, &path, files)?;
                 }
             } else if file_type.is_file() {
+                let metadata = entry.metadata()?;
                 let relative_path = relative_path(root, &path);
                 files.push(IndexedFile {
                     relative_path: PathId::from_user_path(&relative_path),
+                    size_bytes: metadata.len(),
+                    modified_unix_seconds: modified_unix_seconds(&metadata),
                 });
             }
         }
 
         Ok(())
     }
+}
+
+fn modified_unix_seconds(metadata: &fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |duration| duration.as_secs())
 }
 
 fn relative_path(root: &Path, path: &Path) -> String {

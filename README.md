@@ -38,6 +38,12 @@ Build a persistent index file:
 cargo run -p ai-file-search-cli -- index ./tmp-fixture ./tmp-index.txt
 ```
 
+Check pending index changes without rewriting the saved index:
+
+```bash
+cargo run -p ai-file-search-cli -- status ./tmp-fixture ./tmp-index.txt
+```
+
 Refresh a saved index after files change:
 
 ```bash
@@ -62,6 +68,7 @@ cargo run -p ai-file-search-cli -- search ./tmp-fixture file-000042
 ai-file-search search <root> <query>
 ai-file-search index <root> <index-file>
 ai-file-search refresh <root> <index-file>
+ai-file-search status <root> <index-file>
 ai-file-search query <index-file> <query>
 ai-file-search bench <root> <query>
 ai-file-search fixture <root> <count>
@@ -72,6 +79,7 @@ Current behavior:
 - `search` scans a root directory and searches file names in memory.
 - `index` scans a root directory and saves a lightweight local index file with normalized relative paths, file sizes, and modified times.
 - `refresh` rescans a root directory, replaces the saved index, and reports added, updated, removed, and unchanged counts.
+- `status` rescans a root directory and reports added, updated, removed, and unchanged counts without rewriting the saved index.
 - `query` searches a previously saved index file.
 - `bench` reports file count, match count, scan time, and search time.
 - `fixture` creates deterministic files for repeatable local benchmarks.

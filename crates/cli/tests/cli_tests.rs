@@ -31,7 +31,7 @@ fn missing_arguments_return_usage_error() {
     assert_eq!(result.stdout, "");
     assert_eq!(
         result.stderr,
-        "usage: ai-file-search <search <root> <query>|index <root> <index-file>|refresh <root> <index-file>|query <index-file> <query>|bench <root> <query>|fixture <root> <count>>\n"
+        "usage: ai-file-search <search <root> <query>|index <root> <index-file>|refresh <root> <index-file>|status <root> <index-file>|query <index-file> <query>|bench <root> <query>|fixture <root> <count>>\n"
     );
 }
 
@@ -138,6 +138,49 @@ fn refresh_command_removes_stale_paths_from_saved_index() {
     assert_eq!(stale_query_result.exit_code, 0);
     assert_eq!(stale_query_result.stderr, "");
     assert_eq!(stale_query_result.stdout, "");
+}
+
+#[test]
+fn status_command_reports_changes_without_rewriting_index() {
+    let fixture = TestDir::new("status_command_reports_changes_without_rewriting_index");
+    fixture.write_file("Documents/quarterly-report.pdf", "report");
+    fixture.write_file("Downloads/archive.zip", "archive");
+    let index_path = fixture.path().join("index.txt");
+
+    let index_result = run([
+        "index",
+        fixture
+            .path()
+            .to_str()
+            .expect("fixture path should be UTF-8"),
+        index_path.to_str().expect("index path should be UTF-8"),
+    ]);
+    assert_eq!(index_result.exit_code, 0);
+    let original_index_contents =
+        fs::read_to_string(&index_path).expect("index file should be readable");
+
+    fixture.remove_file("Documents/quarterly-report.pdf");
+    fixture.write_file("Documents/new-plan.txt", "plan");
+
+    let status_result = run([
+        "status",
+        fixture
+            .path()
+            .to_str()
+            .expect("fixture path should be UTF-8"),
+        index_path.to_str().expect("index path should be UTF-8"),
+    ]);
+
+    assert_eq!(status_result.exit_code, 0);
+    assert_eq!(status_result.stderr, "");
+    assert_eq!(
+        status_result.stdout,
+        "scanned 2 files\nadded=1\nupdated=0\nremoved=1\nunchanged=1\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&index_path).expect("index file should stay readable"),
+        original_index_contents
+    );
 }
 
 #[test]

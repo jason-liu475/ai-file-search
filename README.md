@@ -50,10 +50,22 @@ Check pending index changes without rewriting the saved index:
 cargo run -p ai-file-search-cli -- status ./tmp-fixture ./tmp-index.txt
 ```
 
+Check pending index changes as JSON:
+
+```bash
+cargo run -p ai-file-search-cli -- status ./tmp-fixture ./tmp-index.txt --json
+```
+
 Read lightweight totals from the saved index without scanning the root:
 
 ```bash
 cargo run -p ai-file-search-cli -- stats ./tmp-index.txt
+```
+
+Read lightweight totals as JSON:
+
+```bash
+cargo run -p ai-file-search-cli -- stats ./tmp-index.txt --json
 ```
 
 Refresh a saved index after files change:
@@ -86,8 +98,8 @@ cargo run -p ai-file-search-cli -- search ./tmp-fixture file-000042
 ai-file-search search <root> <query> [--exclude-name <name>...]
 ai-file-search index <root> <index-file> [--exclude-name <name>...]
 ai-file-search refresh <root> <index-file> [--exclude-name <name>...]
-ai-file-search status <root> <index-file> [--exclude-name <name>...]
-ai-file-search stats <index-file>
+ai-file-search status <root> <index-file> [--exclude-name <name>...] [--json]
+ai-file-search stats <index-file> [--json]
 ai-file-search query <index-file> <query> [--json]
 ai-file-search bench <root> <query> [--exclude-name <name>...]
 ai-file-search fixture <root> <count>
@@ -98,8 +110,8 @@ Current behavior:
 - `search` scans a root directory and searches file names in memory.
 - `index` scans a root directory and saves a lightweight local index file with normalized relative paths, file sizes, and modified times.
 - `refresh` rescans a root directory, replaces the saved index, and reports added, updated, removed, and unchanged counts.
-- `status` rescans a root directory and reports added, updated, removed, and unchanged counts without rewriting the saved index.
-- `stats` reads a saved index and reports file count and total indexed bytes without scanning the root directory.
+- `status` rescans a root directory and reports added, updated, removed, and unchanged counts without rewriting the saved index, with optional JSON output.
+- `stats` reads a saved index and reports file count and total indexed bytes without scanning the root directory, with optional JSON output.
 - `query` searches a previously saved index file, with optional JSON output that includes path, file size, and modified time metadata.
 - `bench` reports file count, match count, scan time, and search time.
 - `fixture` creates deterministic files for repeatable local benchmarks.

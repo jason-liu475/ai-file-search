@@ -40,17 +40,14 @@ pub fn run(args: impl IntoIterator<Item = impl AsRef<str>>) -> CliResult {
             &parsed.positionals[1],
             parsed.scan_options(),
         ),
-        Some("status") if parsed.positionals.len() == 2 && !parsed.json => status(
+        Some("status") if parsed.positionals.len() == 2 => status(
             &parsed.positionals[0],
             &parsed.positionals[1],
             parsed.scan_options(),
+            parsed.output_format(),
         ),
-        Some("stats")
-            if parsed.positionals.len() == 1
-                && parsed.excluded_names.is_empty()
-                && !parsed.json =>
-        {
-            stats(&parsed.positionals[0])
+        Some("stats") if parsed.positionals.len() == 1 && parsed.excluded_names.is_empty() => {
+            stats(&parsed.positionals[0], parsed.output_format())
         }
         Some("query") if parsed.positionals.len() == 2 && parsed.excluded_names.is_empty() => {
             query(
@@ -253,7 +250,7 @@ fn escape_json_string(value: &str) -> String {
     escaped
 }
 
-fn stats(index_path: &str) -> CliResult {
+fn stats(index_path: &str, output_format: OutputFormat) -> CliResult {
     let store = match FileIndexStore::open(Path::new(index_path)) {
         Ok(store) => store,
         Err(error) => {
@@ -265,13 +262,22 @@ fn stats(index_path: &str) -> CliResult {
         }
     };
 
-    CliResult {
-        exit_code: 0,
-        stdout: format!(
+    let stdout = match output_format {
+        OutputFormat::Text => format!(
             "files={}\ntotal_bytes={}\n",
             store.file_count(),
             store.total_size_bytes()
         ),
+        OutputFormat::Json => format!(
+            "{{\"files\":{},\"total_bytes\":{}}}\n",
+            store.file_count(),
+            store.total_size_bytes()
+        ),
+    };
+
+    CliResult {
+        exit_code: 0,
+        stdout,
         stderr: String::new(),
     }
 }
@@ -319,7 +325,12 @@ fn index(root: &str, index_path: &str, options: ScanOptions) -> CliResult {
     }
 }
 
-fn status(root: &str, index_path: &str, options: ScanOptions) -> CliResult {
+fn status(
+    root: &str,
+    index_path: &str,
+    options: ScanOptions,
+    output_format: OutputFormat,
+) -> CliResult {
     let root = Path::new(root);
     let index_path = Path::new(index_path);
     let files = match scan_files_for_index(root, index_path, options) {
@@ -347,9 +358,14 @@ fn status(root: &str, index_path: &str, options: ScanOptions) -> CliResult {
     let old_files = store.all_files();
     let summary = RefreshSummary::compare(&old_files, &files);
 
+    let stdout = match output_format {
+        OutputFormat::Text => format_summary("scanned", file_count, &summary),
+        OutputFormat::Json => format_json_summary(file_count, &summary),
+    };
+
     CliResult {
         exit_code: 0,
-        stdout: format_summary("scanned", file_count, &summary),
+        stdout,
         stderr: String::new(),
     }
 }
@@ -404,6 +420,13 @@ fn format_summary(action: &str, file_count: usize, summary: &RefreshSummary) -> 
     )
 }
 
+fn format_json_summary(file_count: usize, summary: &RefreshSummary) -> String {
+    format!(
+        "{{\"scanned_files\":{file_count},\"added\":{},\"updated\":{},\"removed\":{},\"unchanged\":{}}}\n",
+        summary.added, summary.updated, summary.removed, summary.unchanged
+    )
+}
+
 fn scan_files_for_index(
     root: &Path,
     index_path: &Path,
@@ -433,7 +456,7 @@ fn usage_error() -> CliResult {
     CliResult {
         exit_code: 2,
         stdout: String::new(),
-        stderr: "usage: ai-file-search <search <root> <query> [--exclude-name <name>...]|index <root> <index-file> [--exclude-name <name>...]|refresh <root> <index-file> [--exclude-name <name>...]|status <root> <index-file> [--exclude-name <name>...]|stats <index-file>|query <index-file> <query> [--json]|bench <root> <query> [--exclude-name <name>...]|fixture <root> <count>>\n".to_owned(),
+        stderr: "usage: ai-file-search <search <root> <query> [--exclude-name <name>...]|index <root> <index-file> [--exclude-name <name>...]|refresh <root> <index-file> [--exclude-name <name>...]|status <root> <index-file> [--exclude-name <name>...] [--json]|stats <index-file> [--json]|query <index-file> <query> [--json]|bench <root> <query> [--exclude-name <name>...]|fixture <root> <count>>\n".to_owned(),
     }
 }
 

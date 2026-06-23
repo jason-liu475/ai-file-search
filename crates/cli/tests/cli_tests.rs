@@ -31,7 +31,7 @@ fn missing_arguments_return_usage_error() {
     assert_eq!(result.stdout, "");
     assert_eq!(
         result.stderr,
-        "usage: ai-file-search <search <root> <query> [--exclude-name <name>...]|index <root> <index-file> [--exclude-name <name>...]|refresh <root> <index-file> [--exclude-name <name>...]|status <root> <index-file> [--exclude-name <name>...]|stats <index-file>|query <index-file> <query> [--json]|bench <root> <query> [--exclude-name <name>...]|fixture <root> <count>>\n"
+        "usage: ai-file-search <search <root> <query> [--exclude-name <name>...]|index <root> <index-file> [--exclude-name <name>...]|refresh <root> <index-file> [--exclude-name <name>...]|status <root> <index-file> [--exclude-name <name>...] [--json]|stats <index-file> [--json]|query <index-file> <query> [--json]|bench <root> <query> [--exclude-name <name>...]|fixture <root> <count>>\n"
     );
 }
 
@@ -114,7 +114,7 @@ fn exclude_name_requires_a_value() {
     assert_eq!(result.stdout, "");
     assert_eq!(
         result.stderr,
-        "usage: ai-file-search <search <root> <query> [--exclude-name <name>...]|index <root> <index-file> [--exclude-name <name>...]|refresh <root> <index-file> [--exclude-name <name>...]|status <root> <index-file> [--exclude-name <name>...]|stats <index-file>|query <index-file> <query> [--json]|bench <root> <query> [--exclude-name <name>...]|fixture <root> <count>>\n"
+        "usage: ai-file-search <search <root> <query> [--exclude-name <name>...]|index <root> <index-file> [--exclude-name <name>...]|refresh <root> <index-file> [--exclude-name <name>...]|status <root> <index-file> [--exclude-name <name>...] [--json]|stats <index-file> [--json]|query <index-file> <query> [--json]|bench <root> <query> [--exclude-name <name>...]|fixture <root> <count>>\n"
     );
 }
 
@@ -179,13 +179,16 @@ fn query_command_can_print_json_results_with_metadata() {
 }
 
 #[test]
-fn json_flag_is_only_accepted_for_query() {
-    let fixture = TestDir::new("json_flag_is_only_accepted_for_query");
-    let index_path = fixture.path().join("index.txt");
+fn json_flag_is_rejected_for_commands_without_machine_output() {
+    let fixture = TestDir::new("json_flag_is_rejected_for_commands_without_machine_output");
 
     let result = run([
-        "stats",
-        index_path.to_str().expect("index path should be UTF-8"),
+        "fixture",
+        fixture
+            .path()
+            .to_str()
+            .expect("fixture path should be UTF-8"),
+        "1",
         "--json",
     ]);
 
@@ -193,7 +196,7 @@ fn json_flag_is_only_accepted_for_query() {
     assert_eq!(result.stdout, "");
     assert_eq!(
         result.stderr,
-        "usage: ai-file-search <search <root> <query> [--exclude-name <name>...]|index <root> <index-file> [--exclude-name <name>...]|refresh <root> <index-file> [--exclude-name <name>...]|status <root> <index-file> [--exclude-name <name>...]|stats <index-file>|query <index-file> <query> [--json]|bench <root> <query> [--exclude-name <name>...]|fixture <root> <count>>\n"
+        "usage: ai-file-search <search <root> <query> [--exclude-name <name>...]|index <root> <index-file> [--exclude-name <name>...]|refresh <root> <index-file> [--exclude-name <name>...]|status <root> <index-file> [--exclude-name <name>...] [--json]|stats <index-file> [--json]|query <index-file> <query> [--json]|bench <root> <query> [--exclude-name <name>...]|fixture <root> <count>>\n"
     );
 }
 
@@ -285,6 +288,44 @@ fn status_command_reports_changes_without_rewriting_index() {
 }
 
 #[test]
+fn status_command_can_print_json_summary() {
+    let fixture = TestDir::new("status_command_can_print_json_summary");
+    fixture.write_file("Documents/quarterly-report.pdf", "report");
+    fixture.write_file("Downloads/archive.zip", "archive");
+    let index_path = fixture.path().join("index.txt");
+
+    let index_result = run([
+        "index",
+        fixture
+            .path()
+            .to_str()
+            .expect("fixture path should be UTF-8"),
+        index_path.to_str().expect("index path should be UTF-8"),
+    ]);
+    assert_eq!(index_result.exit_code, 0);
+
+    fixture.remove_file("Documents/quarterly-report.pdf");
+    fixture.write_file("Documents/new-plan.txt", "plan");
+
+    let status_result = run([
+        "status",
+        fixture
+            .path()
+            .to_str()
+            .expect("fixture path should be UTF-8"),
+        index_path.to_str().expect("index path should be UTF-8"),
+        "--json",
+    ]);
+
+    assert_eq!(status_result.exit_code, 0);
+    assert_eq!(status_result.stderr, "");
+    assert_eq!(
+        status_result.stdout,
+        "{\"scanned_files\":2,\"added\":1,\"updated\":0,\"removed\":1,\"unchanged\":1}\n"
+    );
+}
+
+#[test]
 fn stats_command_reports_saved_index_totals_without_scanning_root() {
     let fixture = TestDir::new("stats_command_reports_saved_index_totals_without_scanning_root");
     fixture.write_file("Documents/quarterly-report.pdf", "report");
@@ -310,6 +351,34 @@ fn stats_command_reports_saved_index_totals_without_scanning_root() {
     assert_eq!(stats_result.exit_code, 0);
     assert_eq!(stats_result.stderr, "");
     assert_eq!(stats_result.stdout, "files=2\ntotal_bytes=13\n");
+}
+
+#[test]
+fn stats_command_can_print_json_totals() {
+    let fixture = TestDir::new("stats_command_can_print_json_totals");
+    fixture.write_file("Documents/quarterly-report.pdf", "report");
+    fixture.write_file("Downloads/archive.zip", "archive");
+    let index_path = fixture.path().join("index.txt");
+
+    let index_result = run([
+        "index",
+        fixture
+            .path()
+            .to_str()
+            .expect("fixture path should be UTF-8"),
+        index_path.to_str().expect("index path should be UTF-8"),
+    ]);
+    assert_eq!(index_result.exit_code, 0);
+
+    let stats_result = run([
+        "stats",
+        index_path.to_str().expect("index path should be UTF-8"),
+        "--json",
+    ]);
+
+    assert_eq!(stats_result.exit_code, 0);
+    assert_eq!(stats_result.stderr, "");
+    assert_eq!(stats_result.stdout, "{\"files\":2,\"total_bytes\":13}\n");
 }
 
 #[test]

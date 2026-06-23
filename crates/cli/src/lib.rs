@@ -1,3 +1,4 @@
+use std::fmt::Write;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -24,38 +25,50 @@ pub fn run(args: impl IntoIterator<Item = impl AsRef<str>>) -> CliResult {
     };
 
     match parsed.command.as_deref() {
-        Some("search") if parsed.positionals.len() == 2 => search(
+        Some("search") if parsed.positionals.len() == 2 && !parsed.json => search(
             &parsed.positionals[0],
             &parsed.positionals[1],
             parsed.scan_options(),
         ),
-        Some("index") if parsed.positionals.len() == 2 => index(
+        Some("index") if parsed.positionals.len() == 2 && !parsed.json => index(
             &parsed.positionals[0],
             &parsed.positionals[1],
             parsed.scan_options(),
         ),
-        Some("refresh") if parsed.positionals.len() == 2 => refresh(
+        Some("refresh") if parsed.positionals.len() == 2 && !parsed.json => refresh(
             &parsed.positionals[0],
             &parsed.positionals[1],
             parsed.scan_options(),
         ),
-        Some("status") if parsed.positionals.len() == 2 => status(
+        Some("status") if parsed.positionals.len() == 2 && !parsed.json => status(
             &parsed.positionals[0],
             &parsed.positionals[1],
             parsed.scan_options(),
         ),
-        Some("stats") if parsed.positionals.len() == 1 && parsed.excluded_names.is_empty() => {
+        Some("stats")
+            if parsed.positionals.len() == 1
+                && parsed.excluded_names.is_empty()
+                && !parsed.json =>
+        {
             stats(&parsed.positionals[0])
         }
         Some("query") if parsed.positionals.len() == 2 && parsed.excluded_names.is_empty() => {
-            query(&parsed.positionals[0], &parsed.positionals[1])
+            query(
+                &parsed.positionals[0],
+                &parsed.positionals[1],
+                parsed.output_format(),
+            )
         }
-        Some("bench") if parsed.positionals.len() == 2 => bench(
+        Some("bench") if parsed.positionals.len() == 2 && !parsed.json => bench(
             &parsed.positionals[0],
             &parsed.positionals[1],
             parsed.scan_options(),
         ),
-        Some("fixture") if parsed.positionals.len() == 2 && parsed.excluded_names.is_empty() => {
+        Some("fixture")
+            if parsed.positionals.len() == 2
+                && parsed.excluded_names.is_empty()
+                && !parsed.json =>
+        {
             fixture(&parsed.positionals[0], &parsed.positionals[1])
         }
         _ => usage_error(),
@@ -67,6 +80,7 @@ struct ParsedArgs {
     command: Option<String>,
     positionals: Vec<String>,
     excluded_names: Vec<String>,
+    json: bool,
 }
 
 impl ParsedArgs {
@@ -87,6 +101,10 @@ impl ParsedArgs {
                     parsed.excluded_names.push(name.clone());
                     index += 2;
                 }
+                "--json" => {
+                    parsed.json = true;
+                    index += 1;
+                }
                 argument if argument.starts_with("--") => return Err(()),
                 _ => {
                     parsed.positionals.push(args[index].clone());
@@ -105,6 +123,20 @@ impl ParsedArgs {
                 options.exclude_name(name.clone())
             })
     }
+
+    fn output_format(&self) -> OutputFormat {
+        if self.json {
+            OutputFormat::Json
+        } else {
+            OutputFormat::Text
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutputFormat {
+    Text,
+    Json,
 }
 
 fn search(root: &str, query: &str, options: ScanOptions) -> CliResult {
@@ -145,7 +177,7 @@ fn search(root: &str, query: &str, options: ScanOptions) -> CliResult {
     }
 }
 
-fn query(index_path: &str, query: &str) -> CliResult {
+fn query(index_path: &str, query: &str, output_format: OutputFormat) -> CliResult {
     let store = match FileIndexStore::open(Path::new(index_path)) {
         Ok(store) => store,
         Err(error) => {
@@ -157,16 +189,10 @@ fn query(index_path: &str, query: &str) -> CliResult {
         }
     };
 
-    let stdout = store
-        .search_by_name(query)
-        .iter()
-        .map(|file| file.relative_path.as_normalized())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let stdout = if stdout.is_empty() {
-        stdout
-    } else {
-        format!("{stdout}\n")
+    let results = store.search_by_name(query);
+    let stdout = match output_format {
+        OutputFormat::Text => format_path_results(&results),
+        OutputFormat::Json => format_json_results(&results),
     };
 
     CliResult {
@@ -174,6 +200,57 @@ fn query(index_path: &str, query: &str) -> CliResult {
         stdout,
         stderr: String::new(),
     }
+}
+
+fn format_path_results(results: &[IndexedFile]) -> String {
+    let stdout = results
+        .iter()
+        .map(|file| file.relative_path.as_normalized())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if stdout.is_empty() {
+        stdout
+    } else {
+        format!("{stdout}\n")
+    }
+}
+
+fn format_json_results(results: &[IndexedFile]) -> String {
+    let files = results
+        .iter()
+        .map(|file| {
+            format!(
+                "{{\"path\":\"{}\",\"size_bytes\":{},\"modified_unix_seconds\":{}}}",
+                escape_json_string(file.relative_path.as_normalized()),
+                file.size_bytes,
+                file.modified_unix_seconds
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
+    format!("{{\"files\":[{files}]}}\n")
+}
+
+fn escape_json_string(value: &str) -> String {
+    let mut escaped = String::new();
+
+    for character in value.chars() {
+        match character {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            character if character.is_control() => {
+                let _ = write!(escaped, "\\u{:04x}", character as u32);
+            }
+            character => escaped.push(character),
+        }
+    }
+
+    escaped
 }
 
 fn stats(index_path: &str) -> CliResult {
@@ -356,7 +433,7 @@ fn usage_error() -> CliResult {
     CliResult {
         exit_code: 2,
         stdout: String::new(),
-        stderr: "usage: ai-file-search <search <root> <query> [--exclude-name <name>...]|index <root> <index-file> [--exclude-name <name>...]|refresh <root> <index-file> [--exclude-name <name>...]|status <root> <index-file> [--exclude-name <name>...]|stats <index-file>|query <index-file> <query>|bench <root> <query> [--exclude-name <name>...]|fixture <root> <count>>\n".to_owned(),
+        stderr: "usage: ai-file-search <search <root> <query> [--exclude-name <name>...]|index <root> <index-file> [--exclude-name <name>...]|refresh <root> <index-file> [--exclude-name <name>...]|status <root> <index-file> [--exclude-name <name>...]|stats <index-file>|query <index-file> <query> [--json]|bench <root> <query> [--exclude-name <name>...]|fixture <root> <count>>\n".to_owned(),
     }
 }
 

@@ -31,7 +31,7 @@ fn missing_arguments_return_usage_error() {
     assert_eq!(result.stdout, "");
     assert_eq!(
         result.stderr,
-        "usage: ai-file-search <search <root> <query> [--exclude-name <name>...]|index <root> <index-file> [--exclude-name <name>...]|refresh <root> <index-file> [--exclude-name <name>...]|status <root> <index-file> [--exclude-name <name>...]|stats <index-file>|query <index-file> <query>|bench <root> <query> [--exclude-name <name>...]|fixture <root> <count>>\n"
+        "usage: ai-file-search <search <root> <query> [--exclude-name <name>...]|index <root> <index-file> [--exclude-name <name>...]|refresh <root> <index-file> [--exclude-name <name>...]|status <root> <index-file> [--exclude-name <name>...]|stats <index-file>|query <index-file> <query> [--json]|bench <root> <query> [--exclude-name <name>...]|fixture <root> <count>>\n"
     );
 }
 
@@ -114,7 +114,7 @@ fn exclude_name_requires_a_value() {
     assert_eq!(result.stdout, "");
     assert_eq!(
         result.stderr,
-        "usage: ai-file-search <search <root> <query> [--exclude-name <name>...]|index <root> <index-file> [--exclude-name <name>...]|refresh <root> <index-file> [--exclude-name <name>...]|status <root> <index-file> [--exclude-name <name>...]|stats <index-file>|query <index-file> <query>|bench <root> <query> [--exclude-name <name>...]|fixture <root> <count>>\n"
+        "usage: ai-file-search <search <root> <query> [--exclude-name <name>...]|index <root> <index-file> [--exclude-name <name>...]|refresh <root> <index-file> [--exclude-name <name>...]|status <root> <index-file> [--exclude-name <name>...]|stats <index-file>|query <index-file> <query> [--json]|bench <root> <query> [--exclude-name <name>...]|fixture <root> <count>>\n"
     );
 }
 
@@ -144,6 +144,57 @@ fn query_command_reads_saved_index_file() {
     assert_eq!(query_result.exit_code, 0);
     assert_eq!(query_result.stderr, "");
     assert_eq!(query_result.stdout, "Documents/quarterly-report.pdf\n");
+}
+
+#[test]
+fn query_command_can_print_json_results_with_metadata() {
+    let fixture = TestDir::new("query_command_can_print_json_results_with_metadata");
+    fixture.write_file("Documents/quarterly-report.pdf", "report");
+    fixture.write_file("Downloads/archive.zip", "archive");
+    let index_path = fixture.path().join("index.txt");
+
+    let index_result = run([
+        "index",
+        fixture
+            .path()
+            .to_str()
+            .expect("fixture path should be UTF-8"),
+        index_path.to_str().expect("index path should be UTF-8"),
+    ]);
+    assert_eq!(index_result.exit_code, 0);
+
+    let query_result = run([
+        "query",
+        index_path.to_str().expect("index path should be UTF-8"),
+        "report",
+        "--json",
+    ]);
+
+    assert_eq!(query_result.exit_code, 0);
+    assert_eq!(query_result.stderr, "");
+    assert!(query_result.stdout.starts_with(
+        "{\"files\":[{\"path\":\"Documents/quarterly-report.pdf\",\"size_bytes\":6,\"modified_unix_seconds\":"
+    ));
+    assert!(query_result.stdout.ends_with("}]}\n"));
+}
+
+#[test]
+fn json_flag_is_only_accepted_for_query() {
+    let fixture = TestDir::new("json_flag_is_only_accepted_for_query");
+    let index_path = fixture.path().join("index.txt");
+
+    let result = run([
+        "stats",
+        index_path.to_str().expect("index path should be UTF-8"),
+        "--json",
+    ]);
+
+    assert_eq!(result.exit_code, 2);
+    assert_eq!(result.stdout, "");
+    assert_eq!(
+        result.stderr,
+        "usage: ai-file-search <search <root> <query> [--exclude-name <name>...]|index <root> <index-file> [--exclude-name <name>...]|refresh <root> <index-file> [--exclude-name <name>...]|status <root> <index-file> [--exclude-name <name>...]|stats <index-file>|query <index-file> <query> [--json]|bench <root> <query> [--exclude-name <name>...]|fixture <root> <count>>\n"
+    );
 }
 
 #[test]

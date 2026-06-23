@@ -1,4 +1,4 @@
-﻿# AI File Search
+# AI File Search
 
 AI File Search is a fast, safe, memory-conscious cross-platform local file search engine designed to become a reliable low-cost data entry point for AI tools.
 
@@ -68,6 +68,12 @@ Query the saved index:
 cargo run -p ai-file-search-cli -- query ./tmp-index.txt file-000042
 ```
 
+Query with metadata as JSON for AI tools:
+
+```bash
+cargo run -p ai-file-search-cli -- query ./tmp-index.txt file-000042 --json
+```
+
 For one-shot search without saving an index:
 
 ```bash
@@ -82,7 +88,7 @@ ai-file-search index <root> <index-file> [--exclude-name <name>...]
 ai-file-search refresh <root> <index-file> [--exclude-name <name>...]
 ai-file-search status <root> <index-file> [--exclude-name <name>...]
 ai-file-search stats <index-file>
-ai-file-search query <index-file> <query>
+ai-file-search query <index-file> <query> [--json]
 ai-file-search bench <root> <query> [--exclude-name <name>...]
 ai-file-search fixture <root> <count>
 ```
@@ -94,7 +100,7 @@ Current behavior:
 - `refresh` rescans a root directory, replaces the saved index, and reports added, updated, removed, and unchanged counts.
 - `status` rescans a root directory and reports added, updated, removed, and unchanged counts without rewriting the saved index.
 - `stats` reads a saved index and reports file count and total indexed bytes without scanning the root directory.
-- `query` searches a previously saved index file.
+- `query` searches a previously saved index file, with optional JSON output that includes path, file size, and modified time metadata.
 - `bench` reports file count, match count, scan time, and search time.
 - `fixture` creates deterministic files for repeatable local benchmarks.
 - `--exclude-name <name>` can be repeated on scanning commands to skip directories with an exact file name match, such as `node_modules`, `.git`, or `target`.

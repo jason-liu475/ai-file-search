@@ -1,8 +1,10 @@
-﻿[workspace]
+[workspace]
 members = [
     "crates/core",
     "crates/indexer",
-    "crates/cli"
+    "crates/cli",
+    "crates/protocol",
+    "crates/daemon"
 ]
 resolver = "3"
 

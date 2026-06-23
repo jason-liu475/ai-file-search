@@ -86,6 +86,18 @@ Query with metadata as JSON for AI tools:
 cargo run -p ai-file-search-cli -- query ./tmp-index.txt file-000042 --json
 ```
 
+Run the lightweight JSON-RPC daemon over stdio:
+
+```bash
+cargo run -p ai-file-search-daemon -- stdio ./tmp-index.txt
+```
+
+Send one JSON-RPC request for local testing:
+
+```bash
+echo '{"id":1,"method":"stats","params":{}}' | cargo run -p ai-file-search-daemon -- stdio ./tmp-index.txt
+```
+
 For one-shot search without saving an index:
 
 ```bash
@@ -103,6 +115,7 @@ ai-file-search stats <index-file> [--json]
 ai-file-search query <index-file> <query> [--json]
 ai-file-search bench <root> <query> [--exclude-name <name>...]
 ai-file-search fixture <root> <count>
+ai-file-search-daemon stdio <index-file>
 ```
 
 Current behavior:
@@ -115,6 +128,7 @@ Current behavior:
 - `query` searches a previously saved index file, with optional JSON output that includes path, file size, and modified time metadata.
 - `bench` reports file count, match count, scan time, and search time.
 - `fixture` creates deterministic files for repeatable local benchmarks.
+- `ai-file-search-daemon stdio` keeps a process alive and serves newline-delimited JSON-RPC over stdin/stdout for lightweight AI-tool integration.
 - `--exclude-name <name>` can be repeated on scanning commands to skip directories with an exact file name match, such as `node_modules`, `.git`, or `target`.
 
 ## MVP Limitations
@@ -122,6 +136,7 @@ Current behavior:
 - The persistent store is a simple versioned text file, not SQLite, Tantivy, or an external database.
 - Search is file-name substring search only.
 - File watching and true incremental updates are not implemented yet; `refresh` currently does a full rescan.
+- Cross-platform local IPC transport is not implemented yet; the first daemon cut uses stdio JSON-RPC, with Windows Named Pipe and Unix Domain Socket planned next.
 - Content indexing is not implemented yet.
 - Desktop UI and AI-facing local API are planned after the CLI/core path is stable.
 

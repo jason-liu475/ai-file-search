@@ -82,6 +82,16 @@ impl MemoryIndexStore {
     }
 
     #[must_use]
+    pub fn file_count(&self) -> usize {
+        self.files.len()
+    }
+
+    #[must_use]
+    pub fn total_size_bytes(&self) -> u64 {
+        self.files.values().map(|file| file.size_bytes).sum()
+    }
+
+    #[must_use]
     pub fn search_by_name(&self, query: &str) -> Vec<IndexedFile> {
         let query = query.to_lowercase();
 
@@ -164,6 +174,16 @@ impl FileIndexStore {
     #[must_use]
     pub fn all_files(&self) -> Vec<IndexedFile> {
         self.memory.all_files()
+    }
+
+    #[must_use]
+    pub fn file_count(&self) -> usize {
+        self.memory.file_count()
+    }
+
+    #[must_use]
+    pub fn total_size_bytes(&self) -> u64 {
+        self.memory.total_size_bytes()
     }
 
     /// Saves the current index to disk.

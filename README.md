@@ -44,6 +44,12 @@ Check pending index changes without rewriting the saved index:
 cargo run -p ai-file-search-cli -- status ./tmp-fixture ./tmp-index.txt
 ```
 
+Read lightweight totals from the saved index without scanning the root:
+
+```bash
+cargo run -p ai-file-search-cli -- stats ./tmp-index.txt
+```
+
 Refresh a saved index after files change:
 
 ```bash
@@ -69,6 +75,7 @@ ai-file-search search <root> <query>
 ai-file-search index <root> <index-file>
 ai-file-search refresh <root> <index-file>
 ai-file-search status <root> <index-file>
+ai-file-search stats <index-file>
 ai-file-search query <index-file> <query>
 ai-file-search bench <root> <query>
 ai-file-search fixture <root> <count>
@@ -80,6 +87,7 @@ Current behavior:
 - `index` scans a root directory and saves a lightweight local index file with normalized relative paths, file sizes, and modified times.
 - `refresh` rescans a root directory, replaces the saved index, and reports added, updated, removed, and unchanged counts.
 - `status` rescans a root directory and reports added, updated, removed, and unchanged counts without rewriting the saved index.
+- `stats` reads a saved index and reports file count and total indexed bytes without scanning the root directory.
 - `query` searches a previously saved index file.
 - `bench` reports file count, match count, scan time, and search time.
 - `fixture` creates deterministic files for repeatable local benchmarks.

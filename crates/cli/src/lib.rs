@@ -25,6 +25,7 @@ pub fn run(args: impl IntoIterator<Item = impl AsRef<str>>) -> CliResult {
         Some("index") if args.len() == 3 => index(&args[1], &args[2]),
         Some("refresh") if args.len() == 3 => refresh(&args[1], &args[2]),
         Some("status") if args.len() == 3 => status(&args[1], &args[2]),
+        Some("stats") if args.len() == 2 => stats(&args[1]),
         Some("query") if args.len() == 3 => query(&args[1], &args[2]),
         Some("bench") if args.len() == 3 => bench(&args[1], &args[2]),
         Some("fixture") if args.len() == 3 => fixture(&args[1], &args[2]),
@@ -97,6 +98,29 @@ fn query(index_path: &str, query: &str) -> CliResult {
     CliResult {
         exit_code: 0,
         stdout,
+        stderr: String::new(),
+    }
+}
+
+fn stats(index_path: &str) -> CliResult {
+    let store = match FileIndexStore::open(Path::new(index_path)) {
+        Ok(store) => store,
+        Err(error) => {
+            return CliResult {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: format!("index open failed: {error}\n"),
+            };
+        }
+    };
+
+    CliResult {
+        exit_code: 0,
+        stdout: format!(
+            "files={}\ntotal_bytes={}\n",
+            store.file_count(),
+            store.total_size_bytes()
+        ),
         stderr: String::new(),
     }
 }
@@ -254,7 +278,7 @@ fn usage_error() -> CliResult {
     CliResult {
         exit_code: 2,
         stdout: String::new(),
-        stderr: "usage: ai-file-search <search <root> <query>|index <root> <index-file>|refresh <root> <index-file>|status <root> <index-file>|query <index-file> <query>|bench <root> <query>|fixture <root> <count>>\n".to_owned(),
+        stderr: "usage: ai-file-search <search <root> <query>|index <root> <index-file>|refresh <root> <index-file>|status <root> <index-file>|stats <index-file>|query <index-file> <query>|bench <root> <query>|fixture <root> <count>>\n".to_owned(),
     }
 }
 

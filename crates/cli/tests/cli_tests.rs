@@ -31,7 +31,7 @@ fn missing_arguments_return_usage_error() {
     assert_eq!(result.stdout, "");
     assert_eq!(
         result.stderr,
-        "usage: ai-file-search <search <root> <query>|index <root> <index-file>|refresh <root> <index-file>|status <root> <index-file>|stats <index-file>|query <index-file> <query>|bench <root> <query>|fixture <root> <count>>\n"
+        "usage: ai-file-search <search <root> <query> [--exclude-name <name>...]|index <root> <index-file> [--exclude-name <name>...]|refresh <root> <index-file> [--exclude-name <name>...]|status <root> <index-file> [--exclude-name <name>...]|stats <index-file>|query <index-file> <query>|bench <root> <query> [--exclude-name <name>...]|fixture <root> <count>>\n"
     );
 }
 
@@ -66,6 +66,56 @@ fn index_command_writes_index_file() {
         "mtime should be recorded"
     );
     assert_eq!(fields[2], "Documents/quarterly-report.pdf");
+}
+
+#[test]
+fn index_command_excludes_named_directories() {
+    let fixture = TestDir::new("index_command_excludes_named_directories");
+    fixture.write_file("Documents/quarterly-report.pdf", "report");
+    fixture.write_file("node_modules/cache.bin", "dependency cache");
+    let index_path = fixture.path().join("index.txt");
+
+    let result = run([
+        "index",
+        fixture
+            .path()
+            .to_str()
+            .expect("fixture path should be UTF-8"),
+        index_path.to_str().expect("index path should be UTF-8"),
+        "--exclude-name",
+        "node_modules",
+    ]);
+
+    assert_eq!(result.exit_code, 0);
+    assert_eq!(result.stderr, "");
+    assert_eq!(result.stdout, "indexed 1 files\n");
+
+    let index_contents = fs::read_to_string(index_path).expect("index file should be readable");
+    assert!(index_contents.contains("Documents/quarterly-report.pdf"));
+    assert!(!index_contents.contains("node_modules/cache.bin"));
+}
+
+#[test]
+fn exclude_name_requires_a_value() {
+    let fixture = TestDir::new("exclude_name_requires_a_value");
+    let index_path = fixture.path().join("index.txt");
+
+    let result = run([
+        "index",
+        fixture
+            .path()
+            .to_str()
+            .expect("fixture path should be UTF-8"),
+        index_path.to_str().expect("index path should be UTF-8"),
+        "--exclude-name",
+    ]);
+
+    assert_eq!(result.exit_code, 2);
+    assert_eq!(result.stdout, "");
+    assert_eq!(
+        result.stderr,
+        "usage: ai-file-search <search <root> <query> [--exclude-name <name>...]|index <root> <index-file> [--exclude-name <name>...]|refresh <root> <index-file> [--exclude-name <name>...]|status <root> <index-file> [--exclude-name <name>...]|stats <index-file>|query <index-file> <query>|bench <root> <query> [--exclude-name <name>...]|fixture <root> <count>>\n"
+    );
 }
 
 #[test]

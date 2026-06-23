@@ -19,23 +19,97 @@ pub fn run(args: impl IntoIterator<Item = impl AsRef<str>>) -> CliResult {
         .into_iter()
         .map(|arg| arg.as_ref().to_owned())
         .collect::<Vec<_>>();
+    let Ok(parsed) = ParsedArgs::parse(&args) else {
+        return usage_error();
+    };
 
-    match args.first().map(String::as_str) {
-        Some("search") if args.len() == 3 => search(&args[1], &args[2]),
-        Some("index") if args.len() == 3 => index(&args[1], &args[2]),
-        Some("refresh") if args.len() == 3 => refresh(&args[1], &args[2]),
-        Some("status") if args.len() == 3 => status(&args[1], &args[2]),
-        Some("stats") if args.len() == 2 => stats(&args[1]),
-        Some("query") if args.len() == 3 => query(&args[1], &args[2]),
-        Some("bench") if args.len() == 3 => bench(&args[1], &args[2]),
-        Some("fixture") if args.len() == 3 => fixture(&args[1], &args[2]),
+    match parsed.command.as_deref() {
+        Some("search") if parsed.positionals.len() == 2 => search(
+            &parsed.positionals[0],
+            &parsed.positionals[1],
+            parsed.scan_options(),
+        ),
+        Some("index") if parsed.positionals.len() == 2 => index(
+            &parsed.positionals[0],
+            &parsed.positionals[1],
+            parsed.scan_options(),
+        ),
+        Some("refresh") if parsed.positionals.len() == 2 => refresh(
+            &parsed.positionals[0],
+            &parsed.positionals[1],
+            parsed.scan_options(),
+        ),
+        Some("status") if parsed.positionals.len() == 2 => status(
+            &parsed.positionals[0],
+            &parsed.positionals[1],
+            parsed.scan_options(),
+        ),
+        Some("stats") if parsed.positionals.len() == 1 && parsed.excluded_names.is_empty() => {
+            stats(&parsed.positionals[0])
+        }
+        Some("query") if parsed.positionals.len() == 2 && parsed.excluded_names.is_empty() => {
+            query(&parsed.positionals[0], &parsed.positionals[1])
+        }
+        Some("bench") if parsed.positionals.len() == 2 => bench(
+            &parsed.positionals[0],
+            &parsed.positionals[1],
+            parsed.scan_options(),
+        ),
+        Some("fixture") if parsed.positionals.len() == 2 && parsed.excluded_names.is_empty() => {
+            fixture(&parsed.positionals[0], &parsed.positionals[1])
+        }
         _ => usage_error(),
     }
 }
 
-fn search(root: &str, query: &str) -> CliResult {
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ParsedArgs {
+    command: Option<String>,
+    positionals: Vec<String>,
+    excluded_names: Vec<String>,
+}
+
+impl ParsedArgs {
+    fn parse(args: &[String]) -> Result<Self, ()> {
+        let mut parsed = Self {
+            command: args.first().cloned(),
+            ..Self::default()
+        };
+        let mut index = 1;
+
+        while index < args.len() {
+            match args[index].as_str() {
+                "--exclude-name" => {
+                    let name = args.get(index + 1).ok_or(())?;
+                    if name.is_empty() {
+                        return Err(());
+                    }
+                    parsed.excluded_names.push(name.clone());
+                    index += 2;
+                }
+                argument if argument.starts_with("--") => return Err(()),
+                _ => {
+                    parsed.positionals.push(args[index].clone());
+                    index += 1;
+                }
+            }
+        }
+
+        Ok(parsed)
+    }
+
+    fn scan_options(&self) -> ScanOptions {
+        self.excluded_names
+            .iter()
+            .fold(ScanOptions::default(), |options, name| {
+                options.exclude_name(name.clone())
+            })
+    }
+}
+
+fn search(root: &str, query: &str, options: ScanOptions) -> CliResult {
     let root = Path::new(root);
-    let scanner = Scanner::new(ScanOptions::default());
+    let scanner = Scanner::new(options);
     let files = match scanner.scan(root) {
         Ok(files) => files,
         Err(error) => {
@@ -125,10 +199,10 @@ fn stats(index_path: &str) -> CliResult {
     }
 }
 
-fn index(root: &str, index_path: &str) -> CliResult {
+fn index(root: &str, index_path: &str, options: ScanOptions) -> CliResult {
     let root = Path::new(root);
     let index_path = Path::new(index_path);
-    let files = match scan_files_for_index(root, index_path) {
+    let files = match scan_files_for_index(root, index_path, options) {
         Ok(files) => files,
         Err(error) => {
             return CliResult {
@@ -168,10 +242,10 @@ fn index(root: &str, index_path: &str) -> CliResult {
     }
 }
 
-fn status(root: &str, index_path: &str) -> CliResult {
+fn status(root: &str, index_path: &str, options: ScanOptions) -> CliResult {
     let root = Path::new(root);
     let index_path = Path::new(index_path);
-    let files = match scan_files_for_index(root, index_path) {
+    let files = match scan_files_for_index(root, index_path, options) {
         Ok(files) => files,
         Err(error) => {
             return CliResult {
@@ -203,10 +277,10 @@ fn status(root: &str, index_path: &str) -> CliResult {
     }
 }
 
-fn refresh(root: &str, index_path: &str) -> CliResult {
+fn refresh(root: &str, index_path: &str, options: ScanOptions) -> CliResult {
     let root = Path::new(root);
     let index_path = Path::new(index_path);
-    let files = match scan_files_for_index(root, index_path) {
+    let files = match scan_files_for_index(root, index_path, options) {
         Ok(files) => files,
         Err(error) => {
             return CliResult {
@@ -253,8 +327,12 @@ fn format_summary(action: &str, file_count: usize, summary: &RefreshSummary) -> 
     )
 }
 
-fn scan_files_for_index(root: &Path, index_path: &Path) -> io::Result<Vec<IndexedFile>> {
-    let scanner = Scanner::new(ScanOptions::default());
+fn scan_files_for_index(
+    root: &Path,
+    index_path: &Path,
+    options: ScanOptions,
+) -> io::Result<Vec<IndexedFile>> {
+    let scanner = Scanner::new(options);
     let mut files = scanner.scan(root)?;
 
     if let Some(index_relative_path) = relative_index_path(root, index_path) {
@@ -278,13 +356,13 @@ fn usage_error() -> CliResult {
     CliResult {
         exit_code: 2,
         stdout: String::new(),
-        stderr: "usage: ai-file-search <search <root> <query>|index <root> <index-file>|refresh <root> <index-file>|status <root> <index-file>|stats <index-file>|query <index-file> <query>|bench <root> <query>|fixture <root> <count>>\n".to_owned(),
+        stderr: "usage: ai-file-search <search <root> <query> [--exclude-name <name>...]|index <root> <index-file> [--exclude-name <name>...]|refresh <root> <index-file> [--exclude-name <name>...]|status <root> <index-file> [--exclude-name <name>...]|stats <index-file>|query <index-file> <query>|bench <root> <query> [--exclude-name <name>...]|fixture <root> <count>>\n".to_owned(),
     }
 }
 
-fn bench(root: &str, query: &str) -> CliResult {
+fn bench(root: &str, query: &str, options: ScanOptions) -> CliResult {
     let root = Path::new(root);
-    let scanner = Scanner::new(ScanOptions::default());
+    let scanner = Scanner::new(options);
 
     let scan_start = Instant::now();
     let files = match scanner.scan(root) {

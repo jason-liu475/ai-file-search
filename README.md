@@ -38,6 +38,12 @@ Build a persistent index file:
 cargo run -p ai-file-search-cli -- index ./tmp-fixture ./tmp-index.txt
 ```
 
+Skip noisy directories by exact directory name while scanning:
+
+```bash
+cargo run -p ai-file-search-cli -- index ./my-repo ./repo-index.txt --exclude-name node_modules --exclude-name .git
+```
+
 Check pending index changes without rewriting the saved index:
 
 ```bash
@@ -71,13 +77,13 @@ cargo run -p ai-file-search-cli -- search ./tmp-fixture file-000042
 ## CLI Commands
 
 ```text
-ai-file-search search <root> <query>
-ai-file-search index <root> <index-file>
-ai-file-search refresh <root> <index-file>
-ai-file-search status <root> <index-file>
+ai-file-search search <root> <query> [--exclude-name <name>...]
+ai-file-search index <root> <index-file> [--exclude-name <name>...]
+ai-file-search refresh <root> <index-file> [--exclude-name <name>...]
+ai-file-search status <root> <index-file> [--exclude-name <name>...]
 ai-file-search stats <index-file>
 ai-file-search query <index-file> <query>
-ai-file-search bench <root> <query>
+ai-file-search bench <root> <query> [--exclude-name <name>...]
 ai-file-search fixture <root> <count>
 ```
 
@@ -91,6 +97,7 @@ Current behavior:
 - `query` searches a previously saved index file.
 - `bench` reports file count, match count, scan time, and search time.
 - `fixture` creates deterministic files for repeatable local benchmarks.
+- `--exclude-name <name>` can be repeated on scanning commands to skip directories with an exact file name match, such as `node_modules`, `.git`, or `target`.
 
 ## MVP Limitations
 

@@ -771,7 +771,7 @@ where
     runtime.block_on(run_async(args))
 }
 
-async fn run_async(args: Vec<String>) -> CliResult {
+pub async fn run_async(args: Vec<String>) -> CliResult {
     match args.first().map(String::as_str) {
         Some("service") => service_command(&args[1..]).await,
         Some("handle") if args.len() == 3 => {
@@ -795,7 +795,7 @@ fn usage_error() -> CliResult {
 }
 ```
 
-Keep the existing interactive `stdio`, `ipc`, and `ipc-request` code in `main.rs` initially, then delegate service and handle parser behavior to the library runner. This keeps the first service CLI tests focused and avoids rewriting stdin/stdout plumbing in one step.
+Keep the existing interactive `stdio`, `ipc`, and `ipc-request` code in `main.rs` initially, then delegate service and handle parser behavior to the async library runner. The synchronous `run(args)` wrapper is for integration tests and other non-async callers only.
 
 - [ ] **Step 4: Implement status and stop**
 
@@ -1048,7 +1048,7 @@ Modify `crates/daemon/src/main.rs` so service commands use the library runner an
 use std::io::{self, BufRead, Read, Write};
 use std::path::Path;
 
-use ai_file_search_daemon::{handle_json_line, run, service_run};
+use ai_file_search_daemon::{handle_json_line, run_async, service_run};
 
 #[tokio::main]
 async fn main() {
@@ -1065,13 +1065,13 @@ async fn async_main() -> i32 {
         Some("ipc-request") if args.len() == 3 => ipc_request(&args[1], &args[2]).await,
         Some("service-run") if args.len() == 3 => service_run(Path::new(&args[1]), &args[2]).await,
         Some("handle" | "service") => {
-            let result = run(args);
+            let result = run_async(args).await;
             print!("{}", result.stdout);
             eprint!("{}", result.stderr);
             result.exit_code
         }
         _ => {
-            let result = run(args);
+            let result = run_async(args).await;
             print!("{}", result.stdout);
             eprint!("{}", result.stderr);
             result.exit_code

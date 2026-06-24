@@ -1,3 +1,5 @@
+pub mod service;
+
 use std::io;
 use std::path::Path;
 

@@ -47,7 +47,7 @@
 - Modify: `crates/daemon/src/lib.rs`
 - Test: `crates/daemon/tests/service_state_tests.rs`
 
-- [ ] **Step 1: Write failing service state tests**
+- [x] **Step 1: Write failing service state tests**
 
 Create `crates/daemon/tests/service_state_tests.rs`:
 
@@ -154,7 +154,7 @@ impl Drop for TestDir {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify failure**
+- [x] **Step 2: Run tests to verify failure**
 
 Run:
 
@@ -164,7 +164,7 @@ cargo test -p ai-file-search-daemon service_state -- --nocapture
 
 Expected: FAIL because `ai_file_search_daemon::service` does not exist.
 
-- [ ] **Step 3: Implement service state module**
+- [x] **Step 3: Implement service state module**
 
 Modify `crates/daemon/Cargo.toml`:
 
@@ -318,7 +318,7 @@ pub fn render_status_json(status: &ServiceStatus) -> String {
 }
 ```
 
-- [ ] **Step 4: Run target tests to verify pass**
+- [x] **Step 4: Run target tests to verify pass**
 
 Run:
 

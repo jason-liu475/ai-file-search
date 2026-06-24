@@ -328,7 +328,7 @@ cargo test -p ai-file-search-daemon service_state -- --nocapture
 
 Expected: PASS for all service state tests.
 
-- [ ] **Step 5: Commit and push Task 1**
+- [x] **Step 5: Commit and push Task 1**
 
 Run:
 
@@ -349,7 +349,7 @@ git push origin main
 - Modify: `crates/daemon/tests/handler_tests.rs`
 - Modify: `crates/daemon/tests/transport_tests.rs`
 
-- [ ] **Step 1: Write failing handler tests**
+- [x] **Step 1: Write failing handler tests**
 
 Append to `crates/daemon/tests/handler_tests.rs`:
 
@@ -383,7 +383,7 @@ fn handler_returns_shutdown_status() {
 }
 ```
 
-- [ ] **Step 2: Write failing shutdown stream test**
+- [x] **Step 2: Write failing shutdown stream test**
 
 Modify the import in `crates/daemon/tests/transport_tests.rs`:
 
@@ -446,7 +446,7 @@ async fn stream_handler_stops_after_shutdown_request() {
 }
 ```
 
-- [ ] **Step 3: Run tests to verify failure**
+- [x] **Step 3: Run tests to verify failure**
 
 Run:
 
@@ -456,7 +456,7 @@ cargo test -p ai-file-search-daemon handler_returns_ping_status handler_returns_
 
 Expected: FAIL because `ping`, `shutdown`, and `StreamStatus` do not exist yet.
 
-- [ ] **Step 4: Implement shutdown-aware handler**
+- [x] **Step 4: Implement shutdown-aware handler**
 
 Modify `crates/daemon/src/lib.rs`:
 
@@ -567,7 +567,7 @@ if status == StreamStatus::ShutdownRequested {
 
 For Unix, use the same pattern after `listener.accept()`.
 
-- [ ] **Step 5: Run target tests to verify pass**
+- [x] **Step 5: Run target tests to verify pass**
 
 Run:
 

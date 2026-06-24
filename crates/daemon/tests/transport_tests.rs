@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ai_file_search_core::PathId;
-use ai_file_search_daemon::handle_json_stream;
+use ai_file_search_daemon::{StreamStatus, handle_json_stream};
 use ai_file_search_indexer::{FileIndexStore, IndexedFile};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -18,9 +18,10 @@ async fn stream_handler_serves_multiple_json_rpc_lines() {
     let (client, server) = tokio::io::duplex(4096);
     let handler_index_path = index_path.clone();
     let handler = tokio::spawn(async move {
-        handle_json_stream(&handler_index_path, server)
+        let status = handle_json_stream(&handler_index_path, server)
             .await
             .expect("stream handler should finish cleanly");
+        assert_eq!(status, StreamStatus::ClientDisconnected);
     });
 
     let mut client = BufReader::new(client);
@@ -61,6 +62,46 @@ async fn stream_handler_serves_multiple_json_rpc_lines() {
     );
 
     handler.await.expect("handler task should join");
+}
+
+#[tokio::test]
+async fn stream_handler_stops_after_shutdown_request() {
+    let fixture = TestDir::new("stream_handler_stops_after_shutdown_request");
+    let index_path = fixture.path().join("index.txt");
+    save_index(
+        &index_path,
+        vec![indexed_file("Documents/report.pdf", 6, 1_700_000_000)],
+    );
+
+    let (client, server) = tokio::io::duplex(4096);
+    let handler_index_path = index_path.clone();
+    let handler = tokio::spawn(async move {
+        handle_json_stream(&handler_index_path, server)
+            .await
+            .expect("stream handler should finish cleanly")
+    });
+
+    let mut client = BufReader::new(client);
+    client
+        .get_mut()
+        .write_all(b"{\"id\":9,\"method\":\"shutdown\",\"params\":{}}\n")
+        .await
+        .expect("shutdown request should write");
+
+    let mut response = String::new();
+    client
+        .read_line(&mut response)
+        .await
+        .expect("shutdown response should read");
+
+    assert_eq!(
+        response,
+        "{\"id\":9,\"result\":{\"status\":\"shutting_down\"}}\n"
+    );
+    assert_eq!(
+        handler.await.expect("handler task should join"),
+        StreamStatus::ShutdownRequested
+    );
 }
 
 struct TestDir {

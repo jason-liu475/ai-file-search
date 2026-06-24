@@ -60,6 +60,34 @@ fn handler_rejects_unknown_methods() {
     assert_eq!(response, Response::error(3, "unknown method: refresh"));
 }
 
+#[test]
+fn handler_returns_ping_status() {
+    let fixture = TestDir::new("handler_returns_ping_status");
+    let response = handle_json_line(
+        &fixture.path().join("index.txt"),
+        r#"{"id":4,"method":"ping","params":{}}"#,
+    );
+
+    assert_eq!(
+        response.to_json_line(),
+        "{\"id\":4,\"result\":{\"status\":\"ok\"}}\n"
+    );
+}
+
+#[test]
+fn handler_returns_shutdown_status() {
+    let fixture = TestDir::new("handler_returns_shutdown_status");
+    let response = handle_json_line(
+        &fixture.path().join("index.txt"),
+        r#"{"id":5,"method":"shutdown","params":{}}"#,
+    );
+
+    assert_eq!(
+        response.to_json_line(),
+        "{\"id\":5,\"result\":{\"status\":\"shutting_down\"}}\n"
+    );
+}
+
 struct TestDir {
     path: PathBuf,
 }

@@ -8,17 +8,56 @@ use ai_file_search_protocol::{Request, Response};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StreamStatus {
+    ClientDisconnected,
+    ShutdownRequested,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HandlerOutcome {
+    pub response: Response,
+    pub shutdown_requested: bool,
+}
+
 #[must_use]
 pub fn handle_json_line(index_path: &Path, line: &str) -> Response {
+    handle_json_request(index_path, line).response
+}
+
+#[must_use]
+pub fn handle_json_request(index_path: &Path, line: &str) -> HandlerOutcome {
     let request = match Request::from_json_line(line) {
         Ok(request) => request,
-        Err(error) => return Response::error(0, format!("invalid request: {error}")),
+        Err(error) => {
+            return HandlerOutcome {
+                response: Response::error(0, format!("invalid request: {error}")),
+                shutdown_requested: false,
+            };
+        }
     };
 
     match request.method.as_str() {
-        "stats" => stats(index_path, request.id),
-        "search" => search(index_path, &request),
-        method => Response::error(request.id, format!("unknown method: {method}")),
+        "ping" => HandlerOutcome {
+            response: Response::success(request.id, json!({ "status": "ok" })),
+            shutdown_requested: false,
+        },
+        "shutdown" => HandlerOutcome {
+            response: Response::success(request.id, json!({ "status": "shutting_down" })),
+            shutdown_requested: true,
+        },
+        "stats" => HandlerOutcome {
+            response: stats(index_path, request.id),
+            shutdown_requested: false,
+        },
+        "search" => HandlerOutcome {
+            response: search(index_path, &request),
+            shutdown_requested: false,
+        },
+        method => HandlerOutcome {
+            response: Response::error(request.id, format!("unknown method: {method}")),
+            shutdown_requested: false,
+        },
     }
 }
 
@@ -73,7 +112,7 @@ fn search(index_path: &Path, request: &Request) -> Response {
 /// # Errors
 ///
 /// Returns an I/O error when the stream cannot be read from or written to.
-pub async fn handle_json_stream<S>(index_path: &Path, stream: S) -> io::Result<()>
+pub async fn handle_json_stream<S>(index_path: &Path, stream: S) -> io::Result<StreamStatus>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -84,15 +123,19 @@ where
         line.clear();
         let bytes_read = stream.read_line(&mut line).await?;
         if bytes_read == 0 {
-            return Ok(());
+            return Ok(StreamStatus::ClientDisconnected);
         }
 
-        let response = handle_json_line(index_path, &line);
+        let outcome = handle_json_request(index_path, &line);
         stream
             .get_mut()
-            .write_all(response.to_json_line().as_bytes())
+            .write_all(outcome.response.to_json_line().as_bytes())
             .await?;
         stream.get_mut().flush().await?;
+
+        if outcome.shutdown_requested {
+            return Ok(StreamStatus::ShutdownRequested);
+        }
     }
 }
 
@@ -143,7 +186,10 @@ pub async fn serve_ipc(index_path: &Path, endpoint: &str) -> io::Result<()> {
     loop {
         let server = ServerOptions::new().create(&endpoint)?;
         server.connect().await?;
-        handle_json_stream(index_path, server).await?;
+        let status = handle_json_stream(index_path, server).await?;
+        if status == StreamStatus::ShutdownRequested {
+            return Ok(());
+        }
     }
 }
 
@@ -174,7 +220,10 @@ pub async fn serve_ipc(index_path: &Path, endpoint: &str) -> io::Result<()> {
     let listener = UnixListener::bind(endpoint)?;
     loop {
         let (stream, _) = listener.accept().await?;
-        handle_json_stream(index_path, stream).await?;
+        let status = handle_json_stream(index_path, stream).await?;
+        if status == StreamStatus::ShutdownRequested {
+            return Ok(());
+        }
     }
 }
 

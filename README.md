@@ -92,10 +92,22 @@ Run the lightweight JSON-RPC daemon over stdio:
 cargo run -p ai-file-search-daemon -- stdio ./tmp-index.txt
 ```
 
+Run the local IPC daemon for long-lived clients:
+
+```bash
+cargo run -p ai-file-search-daemon -- ipc ./tmp-index.txt aifs-search
+```
+
 Send one JSON-RPC request for local testing:
 
 ```bash
 echo '{"id":1,"method":"stats","params":{}}' | cargo run -p ai-file-search-daemon -- stdio ./tmp-index.txt
+```
+
+Send the same request through the platform IPC transport:
+
+```bash
+echo '{"id":1,"method":"stats","params":{}}' | cargo run -p ai-file-search-daemon -- ipc-request aifs-search
 ```
 
 For one-shot search without saving an index:
@@ -116,6 +128,8 @@ ai-file-search query <index-file> <query> [--json]
 ai-file-search bench <root> <query> [--exclude-name <name>...]
 ai-file-search fixture <root> <count>
 ai-file-search-daemon stdio <index-file>
+ai-file-search-daemon ipc <index-file> <endpoint>
+ai-file-search-daemon ipc-request <endpoint> [json-line]
 ```
 
 Current behavior:
@@ -129,6 +143,8 @@ Current behavior:
 - `bench` reports file count, match count, scan time, and search time.
 - `fixture` creates deterministic files for repeatable local benchmarks.
 - `ai-file-search-daemon stdio` keeps a process alive and serves newline-delimited JSON-RPC over stdin/stdout for lightweight AI-tool integration.
+- `ai-file-search-daemon ipc` serves the same JSON-RPC protocol over Windows Named Pipe or Unix Domain Socket for local long-lived clients.
+- `ai-file-search-daemon ipc-request` sends one newline-delimited JSON-RPC request to a local IPC endpoint, either from stdin or the optional command argument.
 - `--exclude-name <name>` can be repeated on scanning commands to skip directories with an exact file name match, such as `node_modules`, `.git`, or `target`.
 
 ## MVP Limitations
@@ -136,7 +152,7 @@ Current behavior:
 - The persistent store is a simple versioned text file, not SQLite, Tantivy, or an external database.
 - Search is file-name substring search only.
 - File watching and true incremental updates are not implemented yet; `refresh` currently does a full rescan.
-- Cross-platform local IPC transport is not implemented yet; the first daemon cut uses stdio JSON-RPC, with Windows Named Pipe and Unix Domain Socket planned next.
+- IPC authentication, service installation, and multi-user access controls are not implemented yet.
 - Content indexing is not implemented yet.
 - Desktop UI and AI-facing local API are planned after the CLI/core path is stable.
 

@@ -14,3 +14,4 @@ ai-file-search-core = { path = "../core" }
 ai-file-search-indexer = { path = "../indexer" }
 ai-file-search-protocol = { path = "../protocol" }
 serde_json = "1"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread"] }

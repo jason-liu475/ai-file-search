@@ -605,7 +605,8 @@ Create `crates/daemon/tests/service_cli_tests.rs`:
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use ai_file_search_daemon::service::{write_state, ServiceState, SERVICE_STATE_ENV};
+use ai_file_search_daemon::run_with_state_path;
+use ai_file_search_daemon::service::{write_state, ServiceState};
 
 #[test]
 fn service_status_json_reports_stopped_without_state_file() {
@@ -667,14 +668,7 @@ fn run_with_state<const N: usize>(
     state_path: &Path,
     args: [&str; N],
 ) -> ai_file_search_daemon::CliResult {
-    let old = std::env::var_os(SERVICE_STATE_ENV);
-    std::env::set_var(SERVICE_STATE_ENV, state_path);
-    let result = ai_file_search_daemon::run(args);
-    match old {
-        Some(value) => std::env::set_var(SERVICE_STATE_ENV, value),
-        None => std::env::remove_var(SERVICE_STATE_ENV),
-    }
-    result
+    run_with_state_path(args, state_path)
 }
 
 struct TestDir {
@@ -716,7 +710,7 @@ Run:
 cargo test -p ai-file-search-daemon service_ -- --nocapture
 ```
 
-Expected: FAIL because `CliResult`, `run`, and service command parsing do not exist.
+Expected: FAIL because `CliResult`, `run_with_state_path`, and service command parsing do not exist.
 
 - [ ] **Step 3: Move CLI behavior into library**
 
@@ -751,11 +745,21 @@ where
     I: IntoIterator<Item = S>,
     S: Into<OsString>,
 {
+    run_with_state_path(args, default_state_path())
+}
+
+#[must_use]
+pub fn run_with_state_path<I, S>(args: I, state_path: impl Into<PathBuf>) -> CliResult
+where
+    I: IntoIterator<Item = S>,
+    S: Into<OsString>,
+{
     let args = args
         .into_iter()
         .map(Into::into)
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
+    let state_path = state_path.into();
 
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
@@ -768,12 +772,16 @@ where
         }
     };
 
-    runtime.block_on(run_async(args))
+    runtime.block_on(run_async_with_state_path(args, state_path))
 }
 
 pub async fn run_async(args: Vec<String>) -> CliResult {
+    run_async_with_state_path(args, default_state_path()).await
+}
+
+pub async fn run_async_with_state_path(args: Vec<String>, state_path: PathBuf) -> CliResult {
     match args.first().map(String::as_str) {
-        Some("service") => service_command(&args[1..]).await,
+        Some("service") => service_command(&args[1..], &state_path).await,
         Some("handle") if args.len() == 3 => {
             let response = handle_json_line(Path::new(&args[1]), &args[2]);
             CliResult {
@@ -802,18 +810,19 @@ Keep the existing interactive `stdio`, `ipc`, and `ipc-request` code in `main.rs
 Add to `crates/daemon/src/lib.rs`:
 
 ```rust
-async fn service_command(args: &[String]) -> CliResult {
+async fn service_command(args: &[String], state_path: &Path) -> CliResult {
     match args.first().map(String::as_str) {
-        Some("status") if args.len() == 1 => service_status(false).await,
-        Some("status") if args.len() == 2 && args[1] == "--json" => service_status(true).await,
-        Some("stop") if args.len() == 1 => service_stop().await,
-        Some("start") => service_start(&args[1..]).await,
+        Some("status") if args.len() == 1 => service_status(false, state_path).await,
+        Some("status") if args.len() == 2 && args[1] == "--json" => {
+            service_status(true, state_path).await
+        }
+        Some("stop") if args.len() == 1 => service_stop(state_path).await,
+        Some("start") => service_start(&args[1..], state_path).await,
         _ => usage_error(),
     }
 }
 
-async fn service_status(json_output: bool) -> CliResult {
-    let state_path = default_state_path();
+async fn service_status(json_output: bool, state_path: &Path) -> CliResult {
     let status = match read_state(&state_path) {
         Ok(Some(state)) => {
             if ping_endpoint(&state.endpoint).await {
@@ -847,8 +856,7 @@ async fn service_status(json_output: bool) -> CliResult {
     }
 }
 
-async fn service_stop() -> CliResult {
-    let state_path = default_state_path();
+async fn service_stop(state_path: &Path) -> CliResult {
     let Some(state) = (match read_state(&state_path) {
         Ok(state) => state,
         Err(error) if error.kind() == io::ErrorKind::InvalidData => None,
@@ -911,7 +919,7 @@ async fn ping_endpoint(endpoint: &str) -> bool {
 Add to `crates/daemon/src/lib.rs`:
 
 ```rust
-async fn service_start(args: &[String]) -> CliResult {
+async fn service_start(args: &[String], state_path: &Path) -> CliResult {
     let Some(index_path) = args.first() else {
         return usage_error();
     };
@@ -933,7 +941,6 @@ async fn service_start(args: &[String]) -> CliResult {
         }
     };
 
-    let state_path = default_state_path();
     if let Ok(Some(state)) = read_state(&state_path) {
         if ping_endpoint(&state.endpoint).await {
             return CliResult {

@@ -88,6 +88,29 @@ fn handler_returns_shutdown_status() {
     );
 }
 
+#[test]
+fn handler_returns_method_catalog() {
+    let fixture = TestDir::new("handler_returns_method_catalog");
+    let response = handle_json_line(
+        &fixture.path().join("index.txt"),
+        r#"{"id":6,"method":"methods","params":{}}"#,
+    );
+
+    assert_eq!(
+        response.to_json_line(),
+        concat!(
+            "{\"id\":6,\"result\":{",
+            "\"methods\":[",
+            "{\"name\":\"methods\",\"params\":{}},",
+            "{\"name\":\"ping\",\"params\":{}},",
+            "{\"name\":\"search\",\"params\":{\"limit\":\"optional u64 default 20\",\"query\":\"string\"}},",
+            "{\"name\":\"shutdown\",\"params\":{}},",
+            "{\"name\":\"stats\",\"params\":{}}",
+            "],\"protocol\":\"ai-file-search-json-rpc\",\"version\":1}}\n"
+        )
+    );
+}
+
 struct TestDir {
     path: PathBuf,
 }

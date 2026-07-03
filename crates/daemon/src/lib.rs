@@ -380,6 +380,10 @@ pub fn handle_json_request(index_path: &Path, line: &str) -> HandlerOutcome {
     };
 
     match request.method.as_str() {
+        "methods" => HandlerOutcome {
+            response: method_catalog(request.id),
+            shutdown_requested: false,
+        },
         "ping" => HandlerOutcome {
             response: Response::success(request.id, json!({ "status": "ok" })),
             shutdown_requested: false,
@@ -401,6 +405,41 @@ pub fn handle_json_request(index_path: &Path, line: &str) -> HandlerOutcome {
             shutdown_requested: false,
         },
     }
+}
+
+fn method_catalog(id: u64) -> Response {
+    Response::success(
+        id,
+        json!({
+            "protocol": "ai-file-search-json-rpc",
+            "version": 1,
+            "methods": [
+                {
+                    "name": "methods",
+                    "params": {},
+                },
+                {
+                    "name": "ping",
+                    "params": {},
+                },
+                {
+                    "name": "search",
+                    "params": {
+                        "query": "string",
+                        "limit": "optional u64 default 20",
+                    },
+                },
+                {
+                    "name": "shutdown",
+                    "params": {},
+                },
+                {
+                    "name": "stats",
+                    "params": {},
+                },
+            ],
+        }),
+    )
 }
 
 fn stats(index_path: &Path, id: u64) -> Response {

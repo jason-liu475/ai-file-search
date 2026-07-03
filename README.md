@@ -110,6 +110,12 @@ Send the same request through the platform IPC transport:
 echo '{"id":1,"method":"stats","params":{}}' | cargo run -p ai-file-search-daemon -- ipc-request aifs-search
 ```
 
+Discover daemon JSON-RPC capabilities:
+
+```bash
+echo '{"id":1,"method":"methods","params":{}}' | cargo run -p ai-file-search-daemon -- ipc-request aifs-search
+```
+
 Run the daemon as a user-level background service:
 
 ```bash
@@ -159,6 +165,18 @@ Current behavior:
 - `ai-file-search-daemon ipc-request` sends one newline-delimited JSON-RPC request to a local IPC endpoint, either from stdin or the optional command argument.
 - `ai-file-search-daemon service start/status/stop` manages a user-level background daemon over the platform IPC transport.
 - `--exclude-name <name>` can be repeated on scanning commands to skip directories with an exact file name match, such as `node_modules`, `.git`, or `target`.
+
+## JSON-RPC Methods
+
+The daemon serves newline-delimited JSON-RPC-like requests over stdio and platform IPC:
+
+```text
+methods  -> returns protocol version and available method names
+ping     -> returns {"status":"ok"}
+stats    -> returns saved-index file and byte totals
+search   -> params {"query":"string","limit":20}
+shutdown -> asks the daemon to stop
+```
 
 ## MVP Limitations
 

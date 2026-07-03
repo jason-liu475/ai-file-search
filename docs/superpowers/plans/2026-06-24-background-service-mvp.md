@@ -1206,7 +1206,7 @@ Get-CimInstance Win32_Process |
 
 Update each completed checkbox in this file from `[ ]` to `[x]` as implementation progresses.
 
-- [ ] **Step 5: Commit and push Task 4**
+- [x] **Step 5: Commit and push Task 4**
 
 Run:
 
@@ -1216,7 +1216,7 @@ git commit -m "docs: document daemon service commands"
 git push origin main
 ```
 
-- [ ] **Step 6: Final clean status check**
+- [x] **Step 6: Final clean status check**
 
 Run:
 

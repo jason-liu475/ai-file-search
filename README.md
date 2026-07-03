@@ -110,6 +110,15 @@ Send the same request through the platform IPC transport:
 echo '{"id":1,"method":"stats","params":{}}' | cargo run -p ai-file-search-daemon -- ipc-request aifs-search
 ```
 
+Run the daemon as a user-level background service:
+
+```bash
+cargo run -p ai-file-search-daemon -- service start ./tmp-index.txt
+cargo run -p ai-file-search-daemon -- service status --json
+echo '{"id":1,"method":"stats","params":{}}' | cargo run -p ai-file-search-daemon -- ipc-request aifs-service
+cargo run -p ai-file-search-daemon -- service stop
+```
+
 For one-shot search without saving an index:
 
 ```bash
@@ -130,6 +139,9 @@ ai-file-search fixture <root> <count>
 ai-file-search-daemon stdio <index-file>
 ai-file-search-daemon ipc <index-file> <endpoint>
 ai-file-search-daemon ipc-request <endpoint> [json-line]
+ai-file-search-daemon service start <index-file> [--endpoint <name>]
+ai-file-search-daemon service status [--json]
+ai-file-search-daemon service stop
 ```
 
 Current behavior:
@@ -145,6 +157,7 @@ Current behavior:
 - `ai-file-search-daemon stdio` keeps a process alive and serves newline-delimited JSON-RPC over stdin/stdout for lightweight AI-tool integration.
 - `ai-file-search-daemon ipc` serves the same JSON-RPC protocol over Windows Named Pipe or Unix Domain Socket for local long-lived clients.
 - `ai-file-search-daemon ipc-request` sends one newline-delimited JSON-RPC request to a local IPC endpoint, either from stdin or the optional command argument.
+- `ai-file-search-daemon service start/status/stop` manages a user-level background daemon over the platform IPC transport.
 - `--exclude-name <name>` can be repeated on scanning commands to skip directories with an exact file name match, such as `node_modules`, `.git`, or `target`.
 
 ## MVP Limitations
@@ -152,7 +165,7 @@ Current behavior:
 - The persistent store is a simple versioned text file, not SQLite, Tantivy, or an external database.
 - Search is file-name substring search only.
 - File watching and true incremental updates are not implemented yet; `refresh` currently does a full rescan.
-- IPC authentication, service installation, and multi-user access controls are not implemented yet.
+- OS service installation, start-on-login, authentication, and multi-user access controls are not implemented yet.
 - Content indexing is not implemented yet.
 - Desktop UI and AI-facing local API are planned after the CLI/core path is stable.
 

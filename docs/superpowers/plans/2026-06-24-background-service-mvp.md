@@ -1119,7 +1119,7 @@ git push origin main
 - Modify: `README.md`
 - Modify: `docs/superpowers/plans/2026-06-24-background-service-mvp.md`
 
-- [ ] **Step 1: Update README**
+- [x] **Step 1: Update README**
 
 Add service commands to the CLI Commands block:
 
@@ -1150,7 +1150,7 @@ Update MVP limitations:
 - OS service installation, start-on-login, authentication, and multi-user access controls are not implemented yet.
 ```
 
-- [ ] **Step 2: Run full automated verification**
+- [x] **Step 2: Run full automated verification**
 
 Run:
 
@@ -1162,7 +1162,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 Expected: all commands exit `0`.
 
-- [ ] **Step 3: Run service smoke test**
+- [x] **Step 3: Run service smoke test**
 
 Run on Windows PowerShell:
 
@@ -1202,7 +1202,7 @@ Get-CimInstance Win32_Process |
   ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
 ```
 
-- [ ] **Step 4: Mark this plan complete**
+- [x] **Step 4: Mark this plan complete**
 
 Update each completed checkbox in this file from `[ ]` to `[x]` as implementation progresses.
 

@@ -103,8 +103,8 @@ fn handler_returns_method_catalog() {
             "\"methods\":[",
             "{\"name\":\"methods\",\"params\":{}},",
             "{\"name\":\"ping\",\"params\":{}},",
-            "{\"name\":\"refresh\",\"params\":{\"exclude_names\":\"optional string array\",\"root\":\"optional string when index stores root\"}},",
-            "{\"name\":\"reindex\",\"params\":{\"exclude_names\":\"optional string array\",\"root\":\"optional string when index stores root\"}},",
+            "{\"name\":\"refresh\",\"params\":{\"exclude_names\":\"optional string array\",\"root\":\"optional string; must match stored root\"}},",
+            "{\"name\":\"reindex\",\"params\":{\"exclude_names\":\"optional string array\",\"root\":\"optional string; must match stored root\"}},",
             "{\"name\":\"search\",\"params\":{\"limit\":\"optional u64 default 20\",\"query\":\"string\"}},",
             "{\"name\":\"shutdown\",\"params\":{}},",
             "{\"name\":\"stats\",\"params\":{}}",
@@ -204,6 +204,42 @@ fn handler_reindexes_from_stored_root_when_root_param_is_omitted() {
     assert_eq!(reindexed.root_path(), Some(root.as_path()));
     assert_eq!(reindexed.search_by_name("stored-root").len(), 1);
     assert!(reindexed.search_by_name("stale").is_empty());
+}
+
+#[test]
+fn handler_rejects_refresh_root_that_differs_from_stored_root() {
+    let fixture = TestDir::new("handler_rejects_refresh_root_that_differs_from_stored_root");
+    let allowed_root = fixture.path().join("allowed-root");
+    let denied_root = fixture.path().join("denied-root");
+    fs::create_dir_all(allowed_root.join("Documents")).expect("allowed root should be created");
+    fs::create_dir_all(denied_root.join("Documents")).expect("denied root should be created");
+    fs::write(denied_root.join("Documents").join("secret.pdf"), "secret")
+        .expect("denied root fixture should be written");
+
+    let index_path = fixture.path().join("index.txt");
+    let mut store = FileIndexStore::open(&index_path).expect("store should open");
+    store.set_root_path(&allowed_root);
+    store.replace_all(vec![indexed_file("stale.txt", 1, 1)]);
+    store.save().expect("store should save");
+    let request = serde_json::json!({
+        "id": 10,
+        "method": "refresh",
+        "params": {
+            "root": denied_root.to_string_lossy(),
+        }
+    })
+    .to_string();
+
+    let response = handle_json_line(&index_path, &request);
+
+    assert_eq!(
+        response.to_json_line(),
+        "{\"id\":10,\"error\":{\"message\":\"root does not match stored index root\"}}\n"
+    );
+    let unchanged = FileIndexStore::open(&index_path).expect("unchanged store should open");
+    assert_eq!(unchanged.root_path(), Some(allowed_root.as_path()));
+    assert_eq!(unchanged.search_by_name("stale").len(), 1);
+    assert!(unchanged.search_by_name("secret").is_empty());
 }
 
 struct TestDir {

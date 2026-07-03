@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use ai_file_search_daemon::run_with_state_path;
 use ai_file_search_daemon::service::{ServiceState, write_state};
+use ai_file_search_indexer::FileIndexStore;
 
 #[test]
 fn service_status_json_reports_stopped_without_state_file() {
@@ -63,6 +64,33 @@ fn service_start_requires_index_file() {
     assert_eq!(result.exit_code, 2);
     assert_eq!(result.stdout, "");
     assert!(result.stderr.starts_with("usage: ai-file-search-daemon "));
+}
+
+#[test]
+fn service_start_requires_index_root_metadata() {
+    let fixture = TestDir::new("service_start_requires_index_root_metadata");
+    let state_path = fixture.path().join("service-state.json");
+    let index_path = fixture.path().join("index.txt");
+    FileIndexStore::open(&index_path)
+        .expect("store should open")
+        .save()
+        .expect("store should save without root metadata");
+
+    let result = run_with_state(
+        &state_path,
+        [
+            "service",
+            "start",
+            index_path.to_str().expect("index path should be UTF-8"),
+        ],
+    );
+
+    assert_eq!(result.exit_code, 1);
+    assert_eq!(result.stdout, "");
+    assert_eq!(
+        result.stderr,
+        "index root metadata missing: run ai-file-search index <root> <index-file>\n"
+    );
 }
 
 fn run_with_state<const N: usize>(

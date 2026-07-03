@@ -204,6 +204,9 @@ async fn service_start(args: &[String], state_path: &Path) -> CliResult {
         Ok(path) => path,
         Err(result) => return result,
     };
+    if let Err(result) = validate_index_root_metadata(&index_path) {
+        return result;
+    }
 
     if let Some(state) = running_state(state_path).await {
         return service_running_result(&state);
@@ -235,6 +238,25 @@ fn resolve_index_path(index_path: &str) -> Result<PathBuf, CliResult> {
         stdout: String::new(),
         stderr: format!("index path resolve failed: {error}\n"),
     })
+}
+
+fn validate_index_root_metadata(index_path: &Path) -> Result<(), CliResult> {
+    let store = FileIndexStore::open(index_path).map_err(|error| CliResult {
+        exit_code: 1,
+        stdout: String::new(),
+        stderr: format!("index open failed: {error}\n"),
+    })?;
+
+    if store.root_path().is_some() {
+        Ok(())
+    } else {
+        Err(CliResult {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "index root metadata missing: run ai-file-search index <root> <index-file>\n"
+                .to_owned(),
+        })
+    }
 }
 
 async fn running_state(state_path: &Path) -> Option<ServiceState> {
@@ -429,14 +451,14 @@ fn method_catalog(id: u64) -> Response {
                 {
                     "name": "refresh",
                     "params": {
-                        "root": "optional string when index stores root",
+                        "root": "optional string; must match stored root",
                         "exclude_names": "optional string array",
                     },
                 },
                 {
                     "name": "reindex",
                     "params": {
-                        "root": "optional string when index stores root",
+                        "root": "optional string; must match stored root",
                         "exclude_names": "optional string array",
                     },
                 },
@@ -470,12 +492,9 @@ fn refresh(index_path: &Path, request: &Request) -> Response {
         Ok(store) => store,
         Err(error) => return Response::error(request.id, format!("index open failed: {error}")),
     };
-    let root = match request.params.get("root").and_then(|root| root.as_str()) {
-        Some(root) => PathBuf::from(root),
-        None => match store.root_path() {
-            Some(root) => root.to_path_buf(),
-            None => return Response::error(request.id, "missing string param: root"),
-        },
+    let root = match refresh_root(&store, &request.params) {
+        Ok(root) => root,
+        Err(message) => return Response::error(request.id, message),
     };
 
     let files = match scan_files_for_index(&root, index_path, options) {
@@ -502,6 +521,36 @@ fn refresh(index_path: &Path, request: &Request) -> Response {
             "unchanged": summary.unchanged,
         }),
     )
+}
+
+fn refresh_root(
+    store: &FileIndexStore,
+    params: &serde_json::Value,
+) -> Result<PathBuf, &'static str> {
+    let requested_root = params
+        .get("root")
+        .and_then(|root| root.as_str())
+        .map(PathBuf::from);
+
+    match (store.root_path(), requested_root) {
+        (Some(stored_root), Some(requested_root)) => {
+            if same_root_path(stored_root, &requested_root) {
+                Ok(stored_root.to_path_buf())
+            } else {
+                Err("root does not match stored index root")
+            }
+        }
+        (Some(stored_root), None) => Ok(stored_root.to_path_buf()),
+        (None, Some(requested_root)) => Ok(requested_root),
+        (None, None) => Err("missing string param: root"),
+    }
+}
+
+fn same_root_path(left: &Path, right: &Path) -> bool {
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
 }
 
 fn scan_options(params: &serde_json::Value) -> Result<ScanOptions, &'static str> {

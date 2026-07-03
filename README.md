@@ -164,6 +164,7 @@ Current behavior:
 - `ai-file-search-daemon ipc` serves the same JSON-RPC protocol over Windows Named Pipe or Unix Domain Socket for local long-lived clients.
 - `ai-file-search-daemon ipc-request` sends one newline-delimited JSON-RPC request to a local IPC endpoint, either from stdin or the optional command argument.
 - `ai-file-search-daemon service start/status/stop` manages a user-level background daemon over the platform IPC transport.
+- `ai-file-search-daemon service start` requires an index file with stored root metadata; `refresh` and `reindex` reject explicit roots that differ from that stored root.
 - `--exclude-name <name>` can be repeated on scanning commands to skip directories with an exact file name match, such as `node_modules`, `.git`, or `target`.
 
 ## JSON-RPC Methods
@@ -173,7 +174,7 @@ The daemon serves newline-delimited JSON-RPC-like requests over stdio and platfo
 ```text
 methods  -> returns protocol version and available method names
 ping     -> returns {"status":"ok"}
-refresh  -> params {"root":"optional if stored","exclude_names":["optional"]}
+refresh  -> params {"root":"optional; must match stored root","exclude_names":["optional"]}
 reindex  -> alias of refresh
 stats    -> returns saved-index file and byte totals
 search   -> params {"query":"string","limit":20}

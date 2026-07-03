@@ -597,7 +597,7 @@ git push origin main
 - Modify: `crates/daemon/src/main.rs`
 - Test: `crates/daemon/tests/service_cli_tests.rs`
 
-- [ ] **Step 1: Write failing service CLI tests**
+- [x] **Step 1: Write failing service CLI tests**
 
 Create `crates/daemon/tests/service_cli_tests.rs`:
 
@@ -702,7 +702,7 @@ impl Drop for TestDir {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify failure**
+- [x] **Step 2: Run tests to verify failure**
 
 Run:
 
@@ -712,7 +712,7 @@ cargo test -p ai-file-search-daemon service_ -- --nocapture
 
 Expected: FAIL because `CliResult`, `run_with_state_path`, and service command parsing do not exist.
 
-- [ ] **Step 3: Move CLI behavior into library**
+- [x] **Step 3: Move CLI behavior into library**
 
 Move daemon CLI behavior from `crates/daemon/src/main.rs` into `crates/daemon/src/lib.rs` so integration tests can call it.
 
@@ -805,7 +805,7 @@ fn usage_error() -> CliResult {
 
 Keep the existing interactive `stdio`, `ipc`, and `ipc-request` code in `main.rs` initially, then delegate service and handle parser behavior to the async library runner. The synchronous `run(args)` wrapper is for integration tests and other non-async callers only.
 
-- [ ] **Step 4: Implement status and stop**
+- [x] **Step 4: Implement status and stop**
 
 Add to `crates/daemon/src/lib.rs`:
 
@@ -914,7 +914,7 @@ async fn ping_endpoint(endpoint: &str) -> bool {
 }
 ```
 
-- [ ] **Step 5: Implement start and service-run**
+- [x] **Step 5: Implement start and service-run**
 
 Add to `crates/daemon/src/lib.rs`:
 
@@ -1089,7 +1089,7 @@ async fn async_main() -> i32 {
 
 Keep the existing `serve_stdio`, `serve_ipc`, `ipc_request`, and `ipc_request_stdin` helper functions below this entry point.
 
-- [ ] **Step 6: Run service CLI tests**
+- [x] **Step 6: Run service CLI tests**
 
 Run:
 

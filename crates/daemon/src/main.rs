@@ -1,7 +1,7 @@
 use std::io::{self, BufRead, Read, Write};
 use std::path::Path;
 
-use ai_file_search_daemon::handle_json_line;
+use ai_file_search_daemon::{handle_json_line, run_async, service_run};
 
 #[tokio::main]
 async fn main() {
@@ -13,15 +13,15 @@ async fn async_main() -> i32 {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     match args.first().map(String::as_str) {
         Some("stdio") if args.len() == 2 => serve_stdio(&args[1]),
-        Some("handle") if args.len() == 3 => handle_once(&args[1], &args[2]),
         Some("ipc") if args.len() == 3 => serve_ipc(&args[1], &args[2]).await,
         Some("ipc-request") if args.len() == 2 => ipc_request_stdin(&args[1]).await,
         Some("ipc-request") if args.len() == 3 => ipc_request(&args[1], &args[2]).await,
+        Some("service-run") if args.len() == 3 => service_run(Path::new(&args[1]), &args[2]).await,
         _ => {
-            eprintln!(
-                "usage: ai-file-search-daemon <stdio <index-file>|handle <index-file> <json-line>|ipc <index-file> <endpoint>|ipc-request <endpoint> [json-line]>"
-            );
-            2
+            let result = run_async(args).await;
+            print!("{}", result.stdout);
+            eprint!("{}", result.stderr);
+            result.exit_code
         }
     }
 }
@@ -49,12 +49,6 @@ fn serve_stdio(index_path: &str) -> i32 {
         }
     }
 
-    0
-}
-
-fn handle_once(index_path: &str, line: &str) -> i32 {
-    let response = handle_json_line(Path::new(index_path), line);
-    print!("{}", response.to_json_line());
     0
 }
 

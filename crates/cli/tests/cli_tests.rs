@@ -2,6 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use ai_file_search_cli::run;
+use ai_file_search_indexer::FileIndexStore;
 
 #[test]
 fn search_command_prints_matching_relative_paths() {
@@ -55,10 +56,11 @@ fn index_command_writes_index_file() {
     assert_eq!(result.stdout, "indexed 1 files\n");
     let index_contents = fs::read_to_string(index_path).expect("index file should be readable");
     let lines = index_contents.lines().collect::<Vec<_>>();
-    assert_eq!(lines.len(), 2);
+    assert_eq!(lines.len(), 3);
     assert_eq!(lines[0], "aifs-index-v1");
+    assert!(lines[1].starts_with("meta\troot\t"));
 
-    let fields = lines[1].split('\t').collect::<Vec<_>>();
+    let fields = lines[2].split('\t').collect::<Vec<_>>();
     assert_eq!(fields.len(), 3);
     assert_eq!(fields[0], "6");
     assert!(
@@ -242,6 +244,9 @@ fn refresh_command_removes_stale_paths_from_saved_index() {
     assert_eq!(stale_query_result.exit_code, 0);
     assert_eq!(stale_query_result.stderr, "");
     assert_eq!(stale_query_result.stdout, "");
+
+    let store = FileIndexStore::open(&index_path).expect("refreshed index should open");
+    assert_eq!(store.root_path(), Some(fixture.path()));
 }
 
 #[test]

@@ -153,7 +153,7 @@ ai-file-search-daemon service stop
 Current behavior:
 
 - `search` scans a root directory and searches file names in memory.
-- `index` scans a root directory and saves a lightweight local index file with normalized relative paths, file sizes, and modified times.
+- `index` scans a root directory and saves a lightweight local index file with normalized relative paths, file sizes, modified times, and the indexed root path.
 - `refresh` rescans a root directory, replaces the saved index, and reports added, updated, removed, and unchanged counts.
 - `status` rescans a root directory and reports added, updated, removed, and unchanged counts without rewriting the saved index, with optional JSON output.
 - `stats` reads a saved index and reports file count and total indexed bytes without scanning the root directory, with optional JSON output.
@@ -173,7 +173,7 @@ The daemon serves newline-delimited JSON-RPC-like requests over stdio and platfo
 ```text
 methods  -> returns protocol version and available method names
 ping     -> returns {"status":"ok"}
-refresh  -> params {"root":"string","exclude_names":["optional"]}
+refresh  -> params {"root":"optional if stored","exclude_names":["optional"]}
 reindex  -> alias of refresh
 stats    -> returns saved-index file and byte totals
 search   -> params {"query":"string","limit":20}

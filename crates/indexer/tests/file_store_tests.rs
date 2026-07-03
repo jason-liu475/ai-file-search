@@ -89,6 +89,33 @@ fn replaced_files_are_saved_after_reopening_store() {
 }
 
 #[test]
+fn root_path_metadata_round_trips_after_reopening_store() {
+    let fixture = TestDir::new("root_path_metadata_round_trips_after_reopening_store");
+    let index_path = fixture.path().join("index.txt");
+    let root_path = fixture.path().join("workspace");
+
+    let mut store = FileIndexStore::open(&index_path).expect("store should open");
+    store.set_root_path(&root_path);
+    store.upsert_file(indexed_file(
+        "Documents/quarterly-report.pdf",
+        18,
+        1_700_000_000,
+    ));
+    store.save().expect("store should save");
+
+    let reopened = FileIndexStore::open(&index_path).expect("store should reopen");
+
+    assert_eq!(reopened.root_path(), Some(root_path.as_path()));
+    assert_eq!(reopened.search_by_name("report").len(), 1);
+    assert!(
+        fs::read_to_string(&index_path)
+            .expect("index file should be readable")
+            .lines()
+            .any(|line| line.starts_with("meta\troot\t"))
+    );
+}
+
+#[test]
 fn opens_legacy_path_only_index_files() {
     let fixture = TestDir::new("opens_legacy_path_only_index_files");
     let index_path = fixture.path().join("index.txt");

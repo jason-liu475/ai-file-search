@@ -103,8 +103,8 @@ fn handler_returns_method_catalog() {
             "\"methods\":[",
             "{\"name\":\"methods\",\"params\":{}},",
             "{\"name\":\"ping\",\"params\":{}},",
-            "{\"name\":\"refresh\",\"params\":{\"exclude_names\":\"optional string array\",\"root\":\"string\"}},",
-            "{\"name\":\"reindex\",\"params\":{\"exclude_names\":\"optional string array\",\"root\":\"string\"}},",
+            "{\"name\":\"refresh\",\"params\":{\"exclude_names\":\"optional string array\",\"root\":\"optional string when index stores root\"}},",
+            "{\"name\":\"reindex\",\"params\":{\"exclude_names\":\"optional string array\",\"root\":\"optional string when index stores root\"}},",
             "{\"name\":\"search\",\"params\":{\"limit\":\"optional u64 default 20\",\"query\":\"string\"}},",
             "{\"name\":\"shutdown\",\"params\":{}},",
             "{\"name\":\"stats\",\"params\":{}}",
@@ -177,6 +177,33 @@ fn handler_reindexes_index_from_root() {
     assert_eq!(store.file_count(), 1);
     assert_eq!(store.search_by_name("final").len(), 1);
     assert!(store.search_by_name("stale").is_empty());
+}
+
+#[test]
+fn handler_reindexes_from_stored_root_when_root_param_is_omitted() {
+    let fixture = TestDir::new("handler_reindexes_from_stored_root_when_root_param_is_omitted");
+    let root = fixture.path().join("root");
+    fs::create_dir_all(root.join("Documents")).expect("documents fixture should be created");
+    fs::write(root.join("Documents").join("stored-root.pdf"), "stored")
+        .expect("stored root fixture should be written");
+
+    let index_path = fixture.path().join("index.txt");
+    let mut store = FileIndexStore::open(&index_path).expect("store should open");
+    store.set_root_path(&root);
+    store.replace_all(vec![indexed_file("stale.txt", 1, 1)]);
+    store.save().expect("store should save");
+
+    let response = handle_json_line(&index_path, r#"{"id":9,"method":"reindex","params":{}}"#);
+
+    assert_eq!(
+        response.to_json_line(),
+        "{\"id\":9,\"result\":{\"added\":1,\"removed\":1,\"scanned_files\":1,\"unchanged\":0,\"updated\":0}}\n"
+    );
+    let reindexed = FileIndexStore::open(&index_path).expect("reindexed store should open");
+    assert_eq!(reindexed.file_count(), 1);
+    assert_eq!(reindexed.root_path(), Some(root.as_path()));
+    assert_eq!(reindexed.search_by_name("stored-root").len(), 1);
+    assert!(reindexed.search_by_name("stale").is_empty());
 }
 
 struct TestDir {

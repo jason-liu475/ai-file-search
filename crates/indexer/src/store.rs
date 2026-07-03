@@ -126,6 +126,7 @@ fn file_name(file: &IndexedFile) -> &str {
 pub struct FileIndexStore {
     path: PathBuf,
     memory: MemoryIndexStore,
+    root_path: Option<PathBuf>,
 }
 
 impl FileIndexStore {
@@ -147,15 +148,32 @@ impl FileIndexStore {
             } else {
                 Box::new(contents.lines())
             };
+            let mut root_path = None;
 
             for line in records.filter(|line| !line.is_empty()) {
+                if has_header {
+                    if let Some(root) = parse_root_metadata_record(line) {
+                        root_path = Some(root);
+                        continue;
+                    }
+                    if is_metadata_record(line) {
+                        continue;
+                    }
+                }
                 memory.upsert_file(parse_index_record(line, has_header));
             }
+
+            return Ok(Self {
+                path: path.to_owned(),
+                memory,
+                root_path,
+            });
         }
 
         Ok(Self {
             path: path.to_owned(),
             memory,
+            root_path: None,
         })
     }
 
@@ -169,6 +187,15 @@ impl FileIndexStore {
 
     pub fn remove_path(&mut self, path: &PathId) {
         self.memory.remove_path(path);
+    }
+
+    pub fn set_root_path(&mut self, root_path: impl AsRef<Path>) {
+        self.root_path = Some(root_path.as_ref().to_path_buf());
+    }
+
+    #[must_use]
+    pub fn root_path(&self) -> Option<&Path> {
+        self.root_path.as_deref()
     }
 
     #[must_use]
@@ -198,6 +225,9 @@ impl FileIndexStore {
         }
 
         let mut lines = vec![INDEX_HEADER.to_owned()];
+        if let Some(root_path) = &self.root_path {
+            lines.push(format_metadata_record("root", &root_path.to_string_lossy()));
+        }
         lines.extend(self.memory.all_files().iter().map(format_index_record));
 
         let mut contents = lines.join("\n");
@@ -212,6 +242,65 @@ impl FileIndexStore {
     pub fn search_by_name(&self, query: &str) -> Vec<IndexedFile> {
         self.memory.search_by_name(query)
     }
+}
+
+fn is_metadata_record(line: &str) -> bool {
+    line.starts_with("meta\t")
+}
+
+fn parse_root_metadata_record(line: &str) -> Option<PathBuf> {
+    let mut parts = line.splitn(3, '\t');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("meta"), Some("root"), Some(value)) => {
+            Some(PathBuf::from(unescape_metadata_value(value)))
+        }
+        _ => None,
+    }
+}
+
+fn format_metadata_record(key: &str, value: &str) -> String {
+    ["meta", key, &escape_metadata_value(value)].join("\t")
+}
+
+fn escape_metadata_value(value: &str) -> String {
+    let mut escaped = String::new();
+
+    for character in value.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '\t' => escaped.push_str("\\t"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            character => escaped.push(character),
+        }
+    }
+
+    escaped
+}
+
+fn unescape_metadata_value(value: &str) -> String {
+    let mut unescaped = String::new();
+    let mut characters = value.chars();
+
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            unescaped.push(character);
+            continue;
+        }
+
+        match characters.next() {
+            Some('\\') | None => unescaped.push('\\'),
+            Some('t') => unescaped.push('\t'),
+            Some('n') => unescaped.push('\n'),
+            Some('r') => unescaped.push('\r'),
+            Some(character) => {
+                unescaped.push('\\');
+                unescaped.push(character);
+            }
+        }
+    }
+
+    unescaped
 }
 
 fn parse_index_record(line: &str, has_header: bool) -> IndexedFile {

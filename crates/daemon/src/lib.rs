@@ -429,14 +429,14 @@ fn method_catalog(id: u64) -> Response {
                 {
                     "name": "refresh",
                     "params": {
-                        "root": "string",
+                        "root": "optional string when index stores root",
                         "exclude_names": "optional string array",
                     },
                 },
                 {
                     "name": "reindex",
                     "params": {
-                        "root": "string",
+                        "root": "optional string when index stores root",
                         "exclude_names": "optional string array",
                     },
                 },
@@ -461,27 +461,32 @@ fn method_catalog(id: u64) -> Response {
 }
 
 fn refresh(index_path: &Path, request: &Request) -> Response {
-    let Some(root) = request.params.get("root").and_then(|root| root.as_str()) else {
-        return Response::error(request.id, "missing string param: root");
-    };
     let options = match scan_options(&request.params) {
         Ok(options) => options,
         Err(message) => return Response::error(request.id, message),
     };
 
-    let root = Path::new(root);
-    let files = match scan_files_for_index(root, index_path, options) {
+    let mut store = match FileIndexStore::open(index_path) {
+        Ok(store) => store,
+        Err(error) => return Response::error(request.id, format!("index open failed: {error}")),
+    };
+    let root = match request.params.get("root").and_then(|root| root.as_str()) {
+        Some(root) => PathBuf::from(root),
+        None => match store.root_path() {
+            Some(root) => root.to_path_buf(),
+            None => return Response::error(request.id, "missing string param: root"),
+        },
+    };
+
+    let files = match scan_files_for_index(&root, index_path, options) {
         Ok(files) => files,
         Err(error) => return Response::error(request.id, format!("scan failed: {error}")),
     };
     let scanned_files = files.len();
 
-    let mut store = match FileIndexStore::open(index_path) {
-        Ok(store) => store,
-        Err(error) => return Response::error(request.id, format!("index open failed: {error}")),
-    };
     let old_files = store.all_files();
     let summary = RefreshSummary::compare(&old_files, &files);
+    store.set_root_path(&root);
     store.replace_all(files);
     if let Err(error) = store.save() {
         return Response::error(request.id, format!("index save failed: {error}"));

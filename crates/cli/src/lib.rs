@@ -307,6 +307,7 @@ fn index(root: &str, index_path: &str, options: ScanOptions) -> CliResult {
             };
         }
     };
+    store.set_root_path(root);
     for file in files {
         store.upsert_file(file);
     }
@@ -397,6 +398,7 @@ fn refresh(root: &str, index_path: &str, options: ScanOptions) -> CliResult {
     };
     let old_files = store.all_files();
     let summary = RefreshSummary::compare(&old_files, &files);
+    store.set_root_path(root);
     store.replace_all(files);
     if let Err(error) = store.save() {
         return CliResult {

@@ -396,7 +396,7 @@ pub fn handle_json_request(index_path: &Path, line: &str) -> HandlerOutcome {
             response: stats(index_path, request.id),
             shutdown_requested: false,
         },
-        "refresh" => HandlerOutcome {
+        "refresh" | "reindex" => HandlerOutcome {
             response: refresh(index_path, &request),
             shutdown_requested: false,
         },
@@ -428,6 +428,13 @@ fn method_catalog(id: u64) -> Response {
                 },
                 {
                     "name": "refresh",
+                    "params": {
+                        "root": "string",
+                        "exclude_names": "optional string array",
+                    },
+                },
+                {
+                    "name": "reindex",
                     "params": {
                         "root": "string",
                         "exclude_names": "optional string array",

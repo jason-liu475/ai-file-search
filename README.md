@@ -174,6 +174,7 @@ The daemon serves newline-delimited JSON-RPC-like requests over stdio and platfo
 methods  -> returns protocol version and available method names
 ping     -> returns {"status":"ok"}
 refresh  -> params {"root":"string","exclude_names":["optional"]}
+reindex  -> alias of refresh
 stats    -> returns saved-index file and byte totals
 search   -> params {"query":"string","limit":20}
 shutdown -> asks the daemon to stop

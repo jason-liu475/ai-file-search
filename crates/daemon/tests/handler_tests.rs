@@ -104,6 +104,7 @@ fn handler_returns_method_catalog() {
             "{\"name\":\"methods\",\"params\":{}},",
             "{\"name\":\"ping\",\"params\":{}},",
             "{\"name\":\"refresh\",\"params\":{\"exclude_names\":\"optional string array\",\"root\":\"string\"}},",
+            "{\"name\":\"reindex\",\"params\":{\"exclude_names\":\"optional string array\",\"root\":\"string\"}},",
             "{\"name\":\"search\",\"params\":{\"limit\":\"optional u64 default 20\",\"query\":\"string\"}},",
             "{\"name\":\"shutdown\",\"params\":{}},",
             "{\"name\":\"stats\",\"params\":{}}",
@@ -145,6 +146,37 @@ fn handler_refreshes_index_from_root() {
     assert_eq!(store.file_count(), 1);
     assert_eq!(store.search_by_name("report").len(), 1);
     assert!(store.search_by_name("ignored").is_empty());
+}
+
+#[test]
+fn handler_reindexes_index_from_root() {
+    let fixture = TestDir::new("handler_reindexes_index_from_root");
+    let root = fixture.path().join("root");
+    fs::create_dir_all(root.join("Documents")).expect("documents fixture should be created");
+    fs::write(root.join("Documents").join("final.pdf"), "final")
+        .expect("final fixture should be written");
+
+    let index_path = fixture.path().join("index.txt");
+    save_index(&index_path, vec![indexed_file("stale.txt", 1, 1)]);
+    let request = serde_json::json!({
+        "id": 8,
+        "method": "reindex",
+        "params": {
+            "root": root.to_string_lossy(),
+        }
+    })
+    .to_string();
+
+    let response = handle_json_line(&index_path, &request);
+
+    assert_eq!(
+        response.to_json_line(),
+        "{\"id\":8,\"result\":{\"added\":1,\"removed\":1,\"scanned_files\":1,\"unchanged\":0,\"updated\":0}}\n"
+    );
+    let store = FileIndexStore::open(&index_path).expect("reindexed store should open");
+    assert_eq!(store.file_count(), 1);
+    assert_eq!(store.search_by_name("final").len(), 1);
+    assert!(store.search_by_name("stale").is_empty());
 }
 
 struct TestDir {

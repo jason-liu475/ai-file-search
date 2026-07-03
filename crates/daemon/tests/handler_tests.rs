@@ -54,10 +54,10 @@ fn handler_rejects_unknown_methods() {
     let fixture = TestDir::new("handler_rejects_unknown_methods");
     let response = handle_json_line(
         &fixture.path().join("index.txt"),
-        r#"{"id":3,"method":"refresh","params":{}}"#,
+        r#"{"id":3,"method":"open","params":{}}"#,
     );
 
-    assert_eq!(response, Response::error(3, "unknown method: refresh"));
+    assert_eq!(response, Response::error(3, "unknown method: open"));
 }
 
 #[test]
@@ -103,12 +103,48 @@ fn handler_returns_method_catalog() {
             "\"methods\":[",
             "{\"name\":\"methods\",\"params\":{}},",
             "{\"name\":\"ping\",\"params\":{}},",
+            "{\"name\":\"refresh\",\"params\":{\"exclude_names\":\"optional string array\",\"root\":\"string\"}},",
             "{\"name\":\"search\",\"params\":{\"limit\":\"optional u64 default 20\",\"query\":\"string\"}},",
             "{\"name\":\"shutdown\",\"params\":{}},",
             "{\"name\":\"stats\",\"params\":{}}",
             "],\"protocol\":\"ai-file-search-json-rpc\",\"version\":1}}\n"
         )
     );
+}
+
+#[test]
+fn handler_refreshes_index_from_root() {
+    let fixture = TestDir::new("handler_refreshes_index_from_root");
+    let root = fixture.path().join("root");
+    fs::create_dir_all(root.join("Documents")).expect("documents fixture should be created");
+    fs::create_dir_all(root.join("node_modules")).expect("excluded fixture should be created");
+    fs::write(root.join("Documents").join("report.pdf"), "report")
+        .expect("report fixture should be written");
+    fs::write(root.join("node_modules").join("ignored.txt"), "ignored")
+        .expect("ignored fixture should be written");
+
+    let index_path = fixture.path().join("index.txt");
+    save_index(&index_path, vec![indexed_file("stale.txt", 1, 1)]);
+    let request = serde_json::json!({
+        "id": 7,
+        "method": "refresh",
+        "params": {
+            "root": root.to_string_lossy(),
+            "exclude_names": ["node_modules"],
+        }
+    })
+    .to_string();
+
+    let response = handle_json_line(&index_path, &request);
+
+    assert_eq!(
+        response.to_json_line(),
+        "{\"id\":7,\"result\":{\"added\":1,\"removed\":1,\"scanned_files\":1,\"unchanged\":0,\"updated\":0}}\n"
+    );
+    let store = FileIndexStore::open(&index_path).expect("refreshed store should open");
+    assert_eq!(store.file_count(), 1);
+    assert_eq!(store.search_by_name("report").len(), 1);
+    assert!(store.search_by_name("ignored").is_empty());
 }
 
 struct TestDir {

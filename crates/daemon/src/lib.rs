@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ai_file_search_indexer::FileIndexStore;
+use ai_file_search_indexer::{FileIndexStore, IndexedFile, RefreshSummary, ScanOptions, Scanner};
 use ai_file_search_protocol::{Request, Response};
 use serde_json::json;
 use service::{
@@ -396,6 +396,10 @@ pub fn handle_json_request(index_path: &Path, line: &str) -> HandlerOutcome {
             response: stats(index_path, request.id),
             shutdown_requested: false,
         },
+        "refresh" => HandlerOutcome {
+            response: refresh(index_path, &request),
+            shutdown_requested: false,
+        },
         "search" => HandlerOutcome {
             response: search(index_path, &request),
             shutdown_requested: false,
@@ -423,6 +427,13 @@ fn method_catalog(id: u64) -> Response {
                     "params": {},
                 },
                 {
+                    "name": "refresh",
+                    "params": {
+                        "root": "string",
+                        "exclude_names": "optional string array",
+                    },
+                },
+                {
                     "name": "search",
                     "params": {
                         "query": "string",
@@ -440,6 +451,87 @@ fn method_catalog(id: u64) -> Response {
             ],
         }),
     )
+}
+
+fn refresh(index_path: &Path, request: &Request) -> Response {
+    let Some(root) = request.params.get("root").and_then(|root| root.as_str()) else {
+        return Response::error(request.id, "missing string param: root");
+    };
+    let options = match scan_options(&request.params) {
+        Ok(options) => options,
+        Err(message) => return Response::error(request.id, message),
+    };
+
+    let root = Path::new(root);
+    let files = match scan_files_for_index(root, index_path, options) {
+        Ok(files) => files,
+        Err(error) => return Response::error(request.id, format!("scan failed: {error}")),
+    };
+    let scanned_files = files.len();
+
+    let mut store = match FileIndexStore::open(index_path) {
+        Ok(store) => store,
+        Err(error) => return Response::error(request.id, format!("index open failed: {error}")),
+    };
+    let old_files = store.all_files();
+    let summary = RefreshSummary::compare(&old_files, &files);
+    store.replace_all(files);
+    if let Err(error) = store.save() {
+        return Response::error(request.id, format!("index save failed: {error}"));
+    }
+
+    Response::success(
+        request.id,
+        json!({
+            "scanned_files": scanned_files,
+            "added": summary.added,
+            "updated": summary.updated,
+            "removed": summary.removed,
+            "unchanged": summary.unchanged,
+        }),
+    )
+}
+
+fn scan_options(params: &serde_json::Value) -> Result<ScanOptions, &'static str> {
+    let Some(excluded_names) = params.get("exclude_names") else {
+        return Ok(ScanOptions::default());
+    };
+    let Some(excluded_names) = excluded_names.as_array() else {
+        return Err("exclude_names must be an array of strings");
+    };
+
+    excluded_names
+        .iter()
+        .try_fold(ScanOptions::default(), |options, name| {
+            name.as_str()
+                .map(|name| options.exclude_name(name.to_owned()))
+                .ok_or("exclude_names must be an array of strings")
+        })
+}
+
+fn scan_files_for_index(
+    root: &Path,
+    index_path: &Path,
+    options: ScanOptions,
+) -> io::Result<Vec<IndexedFile>> {
+    let scanner = Scanner::new(options);
+    let mut files = scanner.scan(root)?;
+
+    if let Some(index_relative_path) = relative_index_path(root, index_path) {
+        files.retain(|file| file.relative_path.as_normalized() != index_relative_path);
+    }
+
+    Ok(files)
+}
+
+fn relative_index_path(root: &Path, index_path: &Path) -> Option<String> {
+    index_path.strip_prefix(root).ok().map(|relative_path| {
+        relative_path
+            .components()
+            .collect::<PathBuf>()
+            .to_string_lossy()
+            .replace('\\', "/")
+    })
 }
 
 fn stats(index_path: &Path, id: u64) -> Response {

@@ -270,6 +270,35 @@ fn handler_returns_current_index_status_without_rewriting_index() {
 }
 
 #[test]
+fn handler_excludes_absolute_index_path_for_relative_stored_root() {
+    let fixture = TestDir::new_relative("index-status");
+    let root = fixture.path().join("root");
+    fs::create_dir_all(&root).expect("root fixture should be created");
+    fs::write(root.join("current.txt"), "current").expect("current fixture should be written");
+
+    let absolute_root = std::env::current_dir()
+        .expect("current directory should be available")
+        .join(&root);
+    let index_path = absolute_root.join("index.txt");
+    save_scanned_index(&index_path, &root);
+    let index_before = fs::read(&index_path).expect("index should be readable before status");
+
+    let response = handle_json_line(
+        &index_path,
+        r#"{"id":16,"method":"index_status","params":{}}"#,
+    );
+
+    assert_eq!(
+        response.to_json_line(),
+        "{\"id\":16,\"result\":{\"added\":0,\"needs_refresh\":false,\"removed\":0,\"scanned_files\":1,\"unchanged\":1,\"updated\":0}}\n"
+    );
+    assert_eq!(
+        fs::read(&index_path).expect("index should be readable after status"),
+        index_before
+    );
+}
+
+#[test]
 fn handler_returns_stale_index_status_without_rewriting_index() {
     let fixture = TestDir::new("handler_returns_stale_index_status_without_rewriting_index");
     let root = fixture.path().join("root");
@@ -381,6 +410,18 @@ impl TestDir {
             "ai-file-search-daemon-{name}-{}",
             std::process::id()
         ));
+
+        if path.exists() {
+            fs::remove_dir_all(&path).expect("old fixture should be removable");
+        }
+        fs::create_dir_all(&path).expect("fixture directory should be created");
+
+        Self { path }
+    }
+
+    fn new_relative(name: &str) -> Self {
+        let path = PathBuf::from("target")
+            .join(format!("aifs-relative-root-{}-{name}", std::process::id()));
 
         if path.exists() {
             fs::remove_dir_all(&path).expect("old fixture should be removable");

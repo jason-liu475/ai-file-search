@@ -630,13 +630,21 @@ fn scan_files_for_index(
 }
 
 fn relative_index_path(root: &Path, index_path: &Path) -> Option<String> {
-    index_path.strip_prefix(root).ok().map(|relative_path| {
+    let relative_path = match (
+        std::fs::canonicalize(root),
+        std::fs::canonicalize(index_path),
+    ) {
+        (Ok(root), Ok(index_path)) => index_path.strip_prefix(root).ok()?.to_path_buf(),
+        _ => index_path.strip_prefix(root).ok()?.to_path_buf(),
+    };
+
+    Some(
         relative_path
             .components()
             .collect::<PathBuf>()
             .to_string_lossy()
-            .replace('\\', "/")
-    })
+            .replace('\\', "/"),
+    )
 }
 
 fn stats(index_path: &Path, id: u64) -> Response {

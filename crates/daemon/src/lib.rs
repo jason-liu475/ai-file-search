@@ -410,6 +410,10 @@ pub fn handle_json_request(index_path: &Path, line: &str) -> HandlerOutcome {
             response: Response::success(request.id, json!({ "status": "ok" })),
             shutdown_requested: false,
         },
+        "index_status" => HandlerOutcome {
+            response: index_status(index_path, &request),
+            shutdown_requested: false,
+        },
         "shutdown" => HandlerOutcome {
             response: Response::success(request.id, json!({ "status": "shutting_down" })),
             shutdown_requested: true,
@@ -449,6 +453,13 @@ fn method_catalog(id: u64) -> Response {
                     "params": {},
                 },
                 {
+                    "name": "index_status",
+                    "params": {
+                        "root": "optional string; must match stored root",
+                        "exclude_names": "optional string array",
+                    },
+                },
+                {
                     "name": "refresh",
                     "params": {
                         "root": "optional string; must match stored root",
@@ -482,6 +493,42 @@ fn method_catalog(id: u64) -> Response {
     )
 }
 
+fn index_status(index_path: &Path, request: &Request) -> Response {
+    let options = match scan_options(&request.params) {
+        Ok(options) => options,
+        Err(message) => return Response::error(request.id, message),
+    };
+
+    let store = match FileIndexStore::open(index_path) {
+        Ok(store) => store,
+        Err(error) => return Response::error(request.id, format!("index open failed: {error}")),
+    };
+    let root = match index_root(&store, &request.params) {
+        Ok(root) => root,
+        Err(message) => return Response::error(request.id, message),
+    };
+
+    let files = match scan_files_for_index(&root, index_path, options) {
+        Ok(files) => files,
+        Err(error) => return Response::error(request.id, format!("scan failed: {error}")),
+    };
+    let scanned_files = files.len();
+    let summary = RefreshSummary::compare(&store.all_files(), &files);
+    let needs_refresh = summary.added > 0 || summary.updated > 0 || summary.removed > 0;
+
+    Response::success(
+        request.id,
+        json!({
+            "scanned_files": scanned_files,
+            "added": summary.added,
+            "updated": summary.updated,
+            "removed": summary.removed,
+            "unchanged": summary.unchanged,
+            "needs_refresh": needs_refresh,
+        }),
+    )
+}
+
 fn refresh(index_path: &Path, request: &Request) -> Response {
     let options = match scan_options(&request.params) {
         Ok(options) => options,
@@ -492,7 +539,7 @@ fn refresh(index_path: &Path, request: &Request) -> Response {
         Ok(store) => store,
         Err(error) => return Response::error(request.id, format!("index open failed: {error}")),
     };
-    let root = match refresh_root(&store, &request.params) {
+    let root = match index_root(&store, &request.params) {
         Ok(root) => root,
         Err(message) => return Response::error(request.id, message),
     };
@@ -523,10 +570,7 @@ fn refresh(index_path: &Path, request: &Request) -> Response {
     )
 }
 
-fn refresh_root(
-    store: &FileIndexStore,
-    params: &serde_json::Value,
-) -> Result<PathBuf, &'static str> {
+fn index_root(store: &FileIndexStore, params: &serde_json::Value) -> Result<PathBuf, &'static str> {
     let requested_root = params
         .get("root")
         .and_then(|root| root.as_str())

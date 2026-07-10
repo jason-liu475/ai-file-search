@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use ai_file_search_core::PathId;
 use ai_file_search_daemon::handle_json_line;
-use ai_file_search_indexer::{FileIndexStore, IndexedFile};
+use ai_file_search_indexer::{FileIndexStore, IndexedFile, ScanOptions, Scanner};
 use ai_file_search_protocol::Response;
 
 #[test]
@@ -103,6 +103,7 @@ fn handler_returns_method_catalog() {
             "\"methods\":[",
             "{\"name\":\"methods\",\"params\":{}},",
             "{\"name\":\"ping\",\"params\":{}},",
+            "{\"name\":\"index_status\",\"params\":{\"exclude_names\":\"optional string array\",\"root\":\"optional string; must match stored root\"}},",
             "{\"name\":\"refresh\",\"params\":{\"exclude_names\":\"optional string array\",\"root\":\"optional string; must match stored root\"}},",
             "{\"name\":\"reindex\",\"params\":{\"exclude_names\":\"optional string array\",\"root\":\"optional string; must match stored root\"}},",
             "{\"name\":\"search\",\"params\":{\"limit\":\"optional u64 default 20\",\"query\":\"string\"}},",
@@ -242,6 +243,133 @@ fn handler_rejects_refresh_root_that_differs_from_stored_root() {
     assert!(unchanged.search_by_name("secret").is_empty());
 }
 
+#[test]
+fn handler_returns_current_index_status_without_rewriting_index() {
+    let fixture = TestDir::new("handler_returns_current_index_status_without_rewriting_index");
+    let root = fixture.path().join("root");
+    fs::create_dir_all(&root).expect("root fixture should be created");
+    fs::write(root.join("current.txt"), "current").expect("current fixture should be written");
+
+    let index_path = root.join("index.txt");
+    save_scanned_index(&index_path, &root);
+    let index_before = fs::read(&index_path).expect("index should be readable before status");
+
+    let response = handle_json_line(
+        &index_path,
+        r#"{"id":11,"method":"index_status","params":{}}"#,
+    );
+
+    assert_eq!(
+        response.to_json_line(),
+        "{\"id\":11,\"result\":{\"added\":0,\"needs_refresh\":false,\"removed\":0,\"scanned_files\":1,\"unchanged\":1,\"updated\":0}}\n"
+    );
+    assert_eq!(
+        fs::read(&index_path).expect("index should be readable after status"),
+        index_before
+    );
+}
+
+#[test]
+fn handler_returns_stale_index_status_without_rewriting_index() {
+    let fixture = TestDir::new("handler_returns_stale_index_status_without_rewriting_index");
+    let root = fixture.path().join("root");
+    fs::create_dir_all(&root).expect("root fixture should be created");
+    fs::write(root.join("unchanged.txt"), "unchanged")
+        .expect("unchanged fixture should be written");
+    fs::write(root.join("updated.txt"), "old").expect("updated fixture should be written");
+    fs::write(root.join("removed.txt"), "removed").expect("removed fixture should be written");
+
+    let index_path = fixture.path().join("index.txt");
+    save_scanned_index(&index_path, &root);
+    fs::write(root.join("updated.txt"), "new content")
+        .expect("updated fixture should be rewritten");
+    fs::remove_file(root.join("removed.txt")).expect("removed fixture should be removed");
+    fs::write(root.join("added.txt"), "added").expect("added fixture should be written");
+    let index_before = fs::read(&index_path).expect("index should be readable before status");
+
+    let response = handle_json_line(
+        &index_path,
+        r#"{"id":12,"method":"index_status","params":{}}"#,
+    );
+
+    assert_eq!(
+        response.to_json_line(),
+        "{\"id\":12,\"result\":{\"added\":1,\"needs_refresh\":true,\"removed\":1,\"scanned_files\":3,\"unchanged\":1,\"updated\":1}}\n"
+    );
+    assert_eq!(
+        fs::read(&index_path).expect("index should be readable after status"),
+        index_before
+    );
+}
+
+#[test]
+fn handler_rejects_index_status_root_that_differs_from_stored_root() {
+    let fixture = TestDir::new("handler_rejects_index_status_root_that_differs_from_stored_root");
+    let allowed_root = fixture.path().join("allowed-root");
+    let denied_root = fixture.path().join("denied-root");
+    fs::create_dir_all(&allowed_root).expect("allowed root should be created");
+    fs::create_dir_all(&denied_root).expect("denied root should be created");
+
+    let index_path = fixture.path().join("index.txt");
+    save_scanned_index(&index_path, &allowed_root);
+    let index_before = fs::read(&index_path).expect("index should be readable before status");
+    let request = serde_json::json!({
+        "id": 13,
+        "method": "index_status",
+        "params": {
+            "root": denied_root.to_string_lossy(),
+        }
+    })
+    .to_string();
+
+    let response = handle_json_line(&index_path, &request);
+
+    assert_eq!(
+        response.to_json_line(),
+        "{\"id\":13,\"error\":{\"message\":\"root does not match stored index root\"}}\n"
+    );
+    assert_eq!(
+        fs::read(&index_path).expect("index should be readable after status"),
+        index_before
+    );
+}
+
+#[test]
+fn handler_requires_index_status_root_without_metadata() {
+    let fixture = TestDir::new("handler_requires_index_status_root_without_metadata");
+    let index_path = fixture.path().join("index.txt");
+    save_index(&index_path, Vec::new());
+
+    let response = handle_json_line(
+        &index_path,
+        r#"{"id":14,"method":"index_status","params":{}}"#,
+    );
+
+    assert_eq!(
+        response.to_json_line(),
+        "{\"id\":14,\"error\":{\"message\":\"missing string param: root\"}}\n"
+    );
+}
+
+#[test]
+fn handler_rejects_invalid_index_status_exclusions() {
+    let fixture = TestDir::new("handler_rejects_invalid_index_status_exclusions");
+    let root = fixture.path().join("root");
+    fs::create_dir_all(&root).expect("root fixture should be created");
+
+    let index_path = fixture.path().join("index.txt");
+    save_scanned_index(&index_path, &root);
+    let response = handle_json_line(
+        &index_path,
+        r#"{"id":15,"method":"index_status","params":{"exclude_names":"target"}}"#,
+    );
+
+    assert_eq!(
+        response.to_json_line(),
+        "{\"id\":15,\"error\":{\"message\":\"exclude_names must be an array of strings\"}}\n"
+    );
+}
+
 struct TestDir {
     path: PathBuf,
 }
@@ -277,6 +405,16 @@ impl Drop for TestDir {
 
 fn save_index(index_path: &Path, files: Vec<IndexedFile>) {
     let mut store = FileIndexStore::open(index_path).expect("store should open");
+    store.replace_all(files);
+    store.save().expect("store should save");
+}
+
+fn save_scanned_index(index_path: &Path, root: &Path) {
+    let files = Scanner::new(ScanOptions::default())
+        .scan(root)
+        .expect("root fixture should scan");
+    let mut store = FileIndexStore::open(index_path).expect("store should open");
+    store.set_root_path(root);
     store.replace_all(files);
     store.save().expect("store should save");
 }

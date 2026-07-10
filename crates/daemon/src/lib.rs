@@ -503,6 +503,12 @@ fn index_status(index_path: &Path, request: &Request) -> Response {
         Ok(store) => store,
         Err(error) => return Response::error(request.id, format!("index open failed: {error}")),
     };
+    if matches!(
+        request.params.get("root"),
+        Some(root) if !root.is_string()
+    ) {
+        return Response::error(request.id, "root must be a string");
+    }
     let root = match index_root(&store, &request.params) {
         Ok(root) => root,
         Err(message) => return Response::error(request.id, message),

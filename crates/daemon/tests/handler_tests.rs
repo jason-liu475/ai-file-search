@@ -399,6 +399,63 @@ fn handler_rejects_invalid_index_status_exclusions() {
     );
 }
 
+#[test]
+fn handler_rejects_non_string_index_status_root() {
+    let fixture = TestDir::new("handler_rejects_non_string_index_status_root");
+    let root = fixture.path().join("root");
+    fs::create_dir_all(&root).expect("root fixture should be created");
+    fs::write(root.join("current.txt"), "current").expect("current fixture should be written");
+
+    let index_path = fixture.path().join("index.txt");
+    save_scanned_index(&index_path, &root);
+    let index_before = fs::read(&index_path).expect("index should be readable before status");
+
+    let response = handle_json_line(
+        &index_path,
+        r#"{"id":17,"method":"index_status","params":{"root":123}}"#,
+    );
+
+    assert_eq!(response, Response::error(17, "root must be a string"));
+    assert_eq!(
+        fs::read(&index_path).expect("index should be readable after status"),
+        index_before
+    );
+}
+
+#[test]
+fn handler_accepts_explicit_index_status_root_without_metadata() {
+    let fixture = TestDir::new("handler_accepts_explicit_index_status_root_without_metadata");
+    let root = fixture.path().join("root");
+    fs::create_dir_all(&root).expect("root fixture should be created");
+    fs::write(root.join("current.txt"), "current").expect("current fixture should be written");
+
+    let files = Scanner::new(ScanOptions::default())
+        .scan(&root)
+        .expect("root fixture should scan");
+    let index_path = fixture.path().join("index.txt");
+    save_index(&index_path, files);
+    let index_before = fs::read(&index_path).expect("index should be readable before status");
+    let request = serde_json::json!({
+        "id": 18,
+        "method": "index_status",
+        "params": {
+            "root": root.to_string_lossy(),
+        }
+    })
+    .to_string();
+
+    let response = handle_json_line(&index_path, &request);
+
+    assert_eq!(
+        response.to_json_line(),
+        "{\"id\":18,\"result\":{\"added\":0,\"needs_refresh\":false,\"removed\":0,\"scanned_files\":1,\"unchanged\":1,\"updated\":0}}\n"
+    );
+    assert_eq!(
+        fs::read(&index_path).expect("index should be readable after status"),
+        index_before
+    );
+}
+
 struct TestDir {
     path: PathBuf,
 }

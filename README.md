@@ -164,7 +164,7 @@ Current behavior:
 - `ai-file-search-daemon ipc` serves the same JSON-RPC protocol over Windows Named Pipe or Unix Domain Socket for local long-lived clients.
 - `ai-file-search-daemon ipc-request` sends one newline-delimited JSON-RPC request to a local IPC endpoint, either from stdin or the optional command argument.
 - `ai-file-search-daemon service start/status/stop` manages a user-level background daemon over the platform IPC transport.
-- `ai-file-search-daemon service start` requires an index file with stored root metadata; `refresh` and `reindex` reject explicit roots that differ from that stored root.
+- `ai-file-search-daemon service start` requires an index file with stored root metadata; `index_status`, `refresh`, and `reindex` reject explicit roots that differ from that stored root.
 - `--exclude-name <name>` can be repeated on scanning commands to skip directories with an exact file name match, such as `node_modules`, `.git`, or `target`.
 
 ## JSON-RPC Methods
@@ -174,6 +174,7 @@ The daemon serves newline-delimited JSON-RPC-like requests over stdio and platfo
 ```text
 methods  -> returns protocol version and available method names
 ping     -> returns {"status":"ok"}
+index_status -> params {"root":"optional; must match stored root","exclude_names":["optional"]}; returns needs_refresh and change counts without saving
 refresh  -> params {"root":"optional; must match stored root","exclude_names":["optional"]}
 reindex  -> alias of refresh
 stats    -> returns saved-index file and byte totals
@@ -185,7 +186,7 @@ shutdown -> asks the daemon to stop
 
 - The persistent store is a simple versioned text file, not SQLite, Tantivy, or an external database.
 - Search is file-name substring search only.
-- File watching and true incremental updates are not implemented yet; `refresh` currently does a full rescan.
+- File watching and true incremental updates are not implemented yet; `index_status` and `refresh` currently perform full rescans.
 - OS service installation, start-on-login, authentication, and multi-user access controls are not implemented yet.
 - Content indexing is not implemented yet.
 - Desktop UI and AI-facing local API are planned after the CLI/core path is stable.

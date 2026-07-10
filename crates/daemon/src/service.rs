@@ -14,6 +14,8 @@ pub struct ServiceState {
     pub pid: u32,
     pub index_path: PathBuf,
     pub started_unix_seconds: u64,
+    #[serde(default)]
+    pub auto_refresh_seconds: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -106,41 +108,46 @@ pub fn remove_state(path: &Path) -> io::Result<()> {
 #[must_use]
 pub fn render_status_text(status: &ServiceStatus) -> String {
     match status {
-        ServiceStatus::Running(state) => format!(
-            "running endpoint={} pid={} index={}\n",
-            state.endpoint,
-            state.pid,
-            state.index_path.display()
-        ),
-        ServiceStatus::Stale(state) => format!(
-            "stale endpoint={} pid={} index={}\n",
-            state.endpoint,
-            state.pid,
-            state.index_path.display()
-        ),
+        ServiceStatus::Running(state) => render_state_text("running", state),
+        ServiceStatus::Stale(state) => render_state_text("stale", state),
         ServiceStatus::Stopped => "stopped\n".to_owned(),
     }
+}
+
+fn render_state_text(status: &str, state: &ServiceState) -> String {
+    let auto_refresh = state
+        .auto_refresh_seconds
+        .map_or_else(String::new, |seconds| format!(" auto refresh: {seconds}s"));
+    format!(
+        "{status} endpoint={} pid={} index={}{}\n",
+        state.endpoint,
+        state.pid,
+        state.index_path.display(),
+        auto_refresh
+    )
 }
 
 #[must_use]
 pub fn render_status_json(status: &ServiceStatus) -> String {
     let value = match status {
-        ServiceStatus::Running(state) => json!({
-            "status": "running",
-            "endpoint": &state.endpoint,
-            "pid": state.pid,
-            "index_path": &state.index_path,
-            "started_unix_seconds": state.started_unix_seconds,
-        }),
-        ServiceStatus::Stale(state) => json!({
-            "status": "stale",
-            "endpoint": &state.endpoint,
-            "pid": state.pid,
-            "index_path": &state.index_path,
-            "started_unix_seconds": state.started_unix_seconds,
-        }),
+        ServiceStatus::Running(state) => render_state_json("running", state),
+        ServiceStatus::Stale(state) => render_state_json("stale", state),
         ServiceStatus::Stopped => json!({ "status": "stopped" }),
     };
 
     format!("{value}\n")
+}
+
+fn render_state_json(status: &str, state: &ServiceState) -> serde_json::Value {
+    let mut value = json!({
+        "status": status,
+        "endpoint": &state.endpoint,
+        "pid": state.pid,
+        "index_path": &state.index_path,
+        "started_unix_seconds": state.started_unix_seconds,
+    });
+    if let Some(seconds) = state.auto_refresh_seconds {
+        value["auto_refresh_seconds"] = json!(seconds);
+    }
+    value
 }

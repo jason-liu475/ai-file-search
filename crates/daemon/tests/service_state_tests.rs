@@ -16,12 +16,30 @@ fn service_state_round_trips_as_json() {
         pid: 42,
         index_path: index_path.clone(),
         started_unix_seconds: 1_782_281_286,
+        auto_refresh_seconds: Some(300),
     };
 
     write_state(&state_path, &state).expect("state should write");
 
     let loaded = read_state(&state_path).expect("state should read");
     assert_eq!(loaded, Some(state));
+}
+
+#[test]
+fn legacy_service_state_defaults_auto_refresh_to_none() {
+    let fixture = TestDir::new("legacy_service_state_defaults_auto_refresh_to_none");
+    let state_path = fixture.path().join("service-state.json");
+    fs::write(
+        &state_path,
+        r#"{"endpoint":"legacy","pid":42,"index_path":"index.txt","started_unix_seconds":1}"#,
+    )
+    .expect("legacy fixture should write");
+
+    let state = read_state(&state_path)
+        .expect("legacy state should read")
+        .expect("legacy state should exist");
+
+    assert_eq!(state.auto_refresh_seconds, None);
 }
 
 #[test]
@@ -53,11 +71,53 @@ fn service_status_renders_running_text() {
         pid: 42,
         index_path: PathBuf::from("C:/tmp/index.txt"),
         started_unix_seconds: 1_782_281_286,
+        auto_refresh_seconds: Some(300),
     };
 
     assert_eq!(
         render_status_text(&ServiceStatus::Running(state)),
-        "running endpoint=aifs-test pid=42 index=C:/tmp/index.txt\n"
+        "running endpoint=aifs-test pid=42 index=C:/tmp/index.txt auto refresh: 300s\n"
+    );
+}
+
+#[test]
+fn service_status_text_omits_auto_refresh_when_disabled() {
+    let state = ServiceState {
+        endpoint: "aifs-test".to_owned(),
+        pid: 42,
+        index_path: PathBuf::from("C:/tmp/index.txt"),
+        started_unix_seconds: 1_782_281_286,
+        auto_refresh_seconds: None,
+    };
+
+    assert!(!render_status_text(&ServiceStatus::Running(state)).contains("auto refresh:"));
+}
+
+#[test]
+fn service_status_json_omits_auto_refresh_when_disabled() {
+    let state = ServiceState {
+        endpoint: "aifs-test".to_owned(),
+        pid: 42,
+        index_path: PathBuf::from("C:/tmp/index.txt"),
+        started_unix_seconds: 1_782_281_286,
+        auto_refresh_seconds: None,
+    };
+
+    assert!(!render_status_json(&ServiceStatus::Running(state)).contains("auto_refresh_seconds"));
+}
+
+#[test]
+fn service_status_json_includes_auto_refresh_when_enabled() {
+    let state = ServiceState {
+        endpoint: "aifs-test".to_owned(),
+        pid: 42,
+        index_path: PathBuf::from("C:/tmp/index.txt"),
+        started_unix_seconds: 1_782_281_286,
+        auto_refresh_seconds: Some(300),
+    };
+
+    assert!(
+        render_status_json(&ServiceStatus::Running(state)).contains("\"auto_refresh_seconds\":300")
     );
 }
 

@@ -16,7 +16,18 @@ use service::{
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::time::sleep;
 
-const USAGE: &str = "usage: ai-file-search-daemon <stdio <index-file>|handle <index-file> <json-line>|ipc <index-file> <endpoint>|ipc-request <endpoint> [json-line]|service start <index-file> [--endpoint <name>]|service status [--json]|service stop>\n";
+const USAGE: &str = "usage: ai-file-search-daemon <stdio <index-file>|handle <index-file> <json-line>|ipc <index-file> <endpoint>|ipc-request <endpoint> [json-line]|service start <index-file> [--endpoint <name>] [--auto-refresh-seconds <seconds>]|service status [--json]|service stop>\n";
+const MIN_AUTO_REFRESH_SECONDS: u64 = 30;
+const MAX_AUTO_REFRESH_SECONDS: u64 = 86_400;
+const SERVICE_STOP_ATTEMPTS: usize = 20;
+
+#[must_use]
+pub fn parse_auto_refresh_seconds(value: &str) -> Option<u64> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| (MIN_AUTO_REFRESH_SECONDS..=MAX_AUTO_REFRESH_SECONDS).contains(seconds))
+}
 
 pub struct CliResult {
     pub exit_code: i32,
@@ -164,28 +175,21 @@ async fn service_stop(state_path: &Path) -> CliResult {
         };
     };
 
-    let _ = send_ipc_request(
-        &state.endpoint,
-        r#"{"id":1,"method":"shutdown","params":{}}"#,
-    )
-    .await;
-
-    for _ in 0..20 {
-        if !ping_endpoint(&state.endpoint).await {
-            if let Err(error) = remove_state(state_path) {
-                return CliResult {
-                    exit_code: 1,
-                    stdout: String::new(),
-                    stderr: format!("service state remove failed: {error}\n"),
-                };
+    for _ in 0..SERVICE_STOP_ATTEMPTS {
+        match send_ipc_request(
+            &state.endpoint,
+            r#"{"id":1,"method":"shutdown","params":{}}"#,
+        )
+        .await
+        {
+            Ok(response) if response.contains(r#""status":"shutting_down""#) => {
+                return wait_for_service_shutdown(&state, state_path).await;
             }
-            return CliResult {
-                exit_code: 0,
-                stdout: "stopped\n".to_owned(),
-                stderr: String::new(),
-            };
+            Err(error) if endpoint_is_unavailable(&error) => {
+                return remove_service_state(state_path);
+            }
+            _ => sleep(Duration::from_millis(50)).await,
         }
-        sleep(Duration::from_millis(50)).await;
     }
 
     CliResult {
@@ -195,12 +199,52 @@ async fn service_stop(state_path: &Path) -> CliResult {
     }
 }
 
+async fn wait_for_service_shutdown(state: &ServiceState, state_path: &Path) -> CliResult {
+    for _ in 0..SERVICE_STOP_ATTEMPTS {
+        match send_ipc_request(&state.endpoint, r#"{"id":1,"method":"ping","params":{}}"#).await {
+            Err(error) if endpoint_is_unavailable(&error) => {
+                return remove_service_state(state_path);
+            }
+            _ => sleep(Duration::from_millis(50)).await,
+        }
+    }
+
+    CliResult {
+        exit_code: 1,
+        stdout: render_status_text(&ServiceStatus::Stale(state.clone())),
+        stderr: String::new(),
+    }
+}
+
+fn endpoint_is_unavailable(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+    ) || cfg!(windows) && error.raw_os_error() == Some(2)
+}
+
+fn remove_service_state(state_path: &Path) -> CliResult {
+    if let Err(error) = remove_state(state_path) {
+        return CliResult {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: format!("service state remove failed: {error}\n"),
+        };
+    }
+
+    CliResult {
+        exit_code: 0,
+        stdout: "stopped\n".to_owned(),
+        stderr: String::new(),
+    }
+}
+
 async fn service_start(args: &[String], state_path: &Path) -> CliResult {
-    let (index_path, endpoint) = match parse_service_start_args(args) {
+    let parsed = match parse_service_start_args(args) {
         Ok(parsed) => parsed,
         Err(result) => return result,
     };
-    let index_path = match resolve_index_path(index_path) {
+    let index_path = match resolve_index_path(parsed.index_path) {
         Ok(path) => path,
         Err(result) => return result,
     };
@@ -212,24 +256,57 @@ async fn service_start(args: &[String], state_path: &Path) -> CliResult {
         return service_running_result(&state);
     }
 
-    let child = match spawn_service_child(&index_path, &endpoint) {
-        Ok(child) => child,
-        Err(result) => return result,
-    };
+    let child =
+        match spawn_service_child(&index_path, &parsed.endpoint, parsed.auto_refresh_seconds) {
+            Ok(child) => child,
+            Err(result) => return result,
+        };
 
-    wait_for_started_service(&endpoint, &index_path, state_path, child.id()).await
+    wait_for_started_service(
+        &parsed.endpoint,
+        &index_path,
+        parsed.auto_refresh_seconds,
+        state_path,
+        child.id(),
+    )
+    .await
 }
 
-fn parse_service_start_args(args: &[String]) -> Result<(&str, String), CliResult> {
+struct ServiceStartArgs<'a> {
+    index_path: &'a str,
+    endpoint: String,
+    auto_refresh_seconds: Option<u64>,
+}
+
+fn parse_service_start_args(args: &[String]) -> Result<ServiceStartArgs<'_>, CliResult> {
     let Some(index_path) = args.first() else {
         return Err(usage_error());
     };
 
-    match args {
-        [_index] => Ok((index_path, DEFAULT_ENDPOINT.to_owned())),
-        [_index, flag, value] if flag == "--endpoint" => Ok((index_path, value.clone())),
-        _ => Err(usage_error()),
+    let mut endpoint = None;
+    let mut auto_refresh_seconds = None;
+    let mut arguments = args[1..].iter();
+    while let Some(flag) = arguments.next() {
+        let Some(value) = arguments.next() else {
+            return Err(usage_error());
+        };
+        match flag.as_str() {
+            "--endpoint" if endpoint.is_none() => endpoint = Some(value.clone()),
+            "--auto-refresh-seconds" if auto_refresh_seconds.is_none() => {
+                let Some(seconds) = parse_auto_refresh_seconds(value) else {
+                    return Err(usage_error());
+                };
+                auto_refresh_seconds = Some(seconds);
+            }
+            _ => return Err(usage_error()),
+        }
     }
+
+    Ok(ServiceStartArgs {
+        index_path,
+        endpoint: endpoint.unwrap_or_else(|| DEFAULT_ENDPOINT.to_owned()),
+        auto_refresh_seconds,
+    })
 }
 
 fn resolve_index_path(index_path: &str) -> Result<PathBuf, CliResult> {
@@ -281,7 +358,11 @@ fn service_running_result(state: &ServiceState) -> CliResult {
     }
 }
 
-fn spawn_service_child(index_path: &Path, endpoint: &str) -> Result<Child, CliResult> {
+fn spawn_service_child(
+    index_path: &Path,
+    endpoint: &str,
+    auto_refresh_seconds: Option<u64>,
+) -> Result<Child, CliResult> {
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(error) => {
@@ -301,6 +382,11 @@ fn spawn_service_child(index_path: &Path, endpoint: &str) -> Result<Child, CliRe
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if let Some(seconds) = auto_refresh_seconds {
+        command
+            .arg("--auto-refresh-seconds")
+            .arg(seconds.to_string());
+    }
 
     #[cfg(windows)]
     {
@@ -319,6 +405,7 @@ fn spawn_service_child(index_path: &Path, endpoint: &str) -> Result<Child, CliRe
 async fn wait_for_started_service(
     endpoint: &str,
     index_path: &Path,
+    auto_refresh_seconds: Option<u64>,
     state_path: &Path,
     pid: u32,
 ) -> CliResult {
@@ -329,6 +416,7 @@ async fn wait_for_started_service(
                 pid,
                 index_path: index_path.to_path_buf(),
                 started_unix_seconds: now_unix_seconds(),
+                auto_refresh_seconds,
             };
             if let Err(error) = write_state(state_path, &state) {
                 let _ =
@@ -367,7 +455,12 @@ async fn ping_endpoint(endpoint: &str) -> bool {
     }
 }
 
-pub async fn service_run(index_path: &Path, endpoint: &str) -> i32 {
+pub async fn service_run(
+    index_path: &Path,
+    endpoint: &str,
+    auto_refresh_seconds: Option<u64>,
+) -> i32 {
+    let _ = auto_refresh_seconds;
     match serve_ipc(index_path, endpoint).await {
         Ok(()) => 0,
         Err(error) => {
@@ -731,6 +824,30 @@ where
     }
 }
 
+async fn handle_one_json_request<S>(index_path: &Path, stream: S) -> io::Result<StreamStatus>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut stream = BufReader::new(stream);
+    let mut line = String::new();
+    if stream.read_line(&mut line).await? == 0 {
+        return Ok(StreamStatus::ClientDisconnected);
+    }
+
+    let outcome = handle_json_request(index_path, &line);
+    stream
+        .get_mut()
+        .write_all(outcome.response.to_json_line().as_bytes())
+        .await?;
+    stream.get_mut().flush().await?;
+
+    Ok(if outcome.shutdown_requested {
+        StreamStatus::ShutdownRequested
+    } else {
+        StreamStatus::ClientDisconnected
+    })
+}
+
 /// Sends one newline-delimited JSON-RPC request on a bidirectional async stream.
 ///
 /// # Errors
@@ -750,6 +867,7 @@ where
     let mut stream = BufReader::new(stream);
     let mut response = String::new();
     stream.read_line(&mut response).await?;
+    stream.get_mut().shutdown().await?;
 
     Ok(response)
 }
@@ -778,7 +896,7 @@ pub async fn serve_ipc(index_path: &Path, endpoint: &str) -> io::Result<()> {
     loop {
         let server = ServerOptions::new().create(&endpoint)?;
         server.connect().await?;
-        let status = handle_json_stream(index_path, server).await?;
+        let status = handle_one_json_request(index_path, server).await?;
         if status == StreamStatus::ShutdownRequested {
             return Ok(());
         }

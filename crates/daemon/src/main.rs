@@ -1,7 +1,7 @@
 use std::io::{self, BufRead, Read, Write};
 use std::path::Path;
 
-use ai_file_search_daemon::{handle_json_line, run_async, service_run};
+use ai_file_search_daemon::{handle_json_line, parse_auto_refresh_seconds, run_async, service_run};
 
 #[tokio::main]
 async fn main() {
@@ -16,14 +16,24 @@ async fn async_main() -> i32 {
         Some("ipc") if args.len() == 3 => serve_ipc(&args[1], &args[2]).await,
         Some("ipc-request") if args.len() == 2 => ipc_request_stdin(&args[1]).await,
         Some("ipc-request") if args.len() == 3 => ipc_request(&args[1], &args[2]).await,
-        Some("service-run") if args.len() == 3 => service_run(Path::new(&args[1]), &args[2]).await,
-        _ => {
-            let result = run_async(args).await;
-            print!("{}", result.stdout);
-            eprint!("{}", result.stderr);
-            result.exit_code
+        Some("service-run") if args.len() == 3 => {
+            service_run(Path::new(&args[1]), &args[2], None).await
         }
+        Some("service-run") if args.len() == 5 && args[3] == "--auto-refresh-seconds" => {
+            match parse_auto_refresh_seconds(&args[4]) {
+                Some(seconds) => service_run(Path::new(&args[1]), &args[2], Some(seconds)).await,
+                None => run_cli(args).await,
+            }
+        }
+        _ => run_cli(args).await,
     }
+}
+
+async fn run_cli(args: Vec<String>) -> i32 {
+    let result = run_async(args).await;
+    print!("{}", result.stdout);
+    eprint!("{}", result.stderr);
+    result.exit_code
 }
 
 fn serve_stdio(index_path: &str) -> i32 {

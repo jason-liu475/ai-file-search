@@ -455,7 +455,7 @@ fn method_catalog(id: u64) -> Response {
                 {
                     "name": "index_status",
                     "params": {
-                        "root": "optional string; must match stored root",
+                        "root": "optional string with stored root metadata (if supplied, must match); otherwise required",
                         "exclude_names": "optional string array",
                     },
                 },

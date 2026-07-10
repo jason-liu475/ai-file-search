@@ -103,7 +103,7 @@ fn handler_returns_method_catalog() {
             "\"methods\":[",
             "{\"name\":\"methods\",\"params\":{}},",
             "{\"name\":\"ping\",\"params\":{}},",
-            "{\"name\":\"index_status\",\"params\":{\"exclude_names\":\"optional string array\",\"root\":\"optional string; must match stored root\"}},",
+            "{\"name\":\"index_status\",\"params\":{\"exclude_names\":\"optional string array\",\"root\":\"optional string with stored root metadata (if supplied, must match); otherwise required\"}},",
             "{\"name\":\"refresh\",\"params\":{\"exclude_names\":\"optional string array\",\"root\":\"optional string; must match stored root\"}},",
             "{\"name\":\"reindex\",\"params\":{\"exclude_names\":\"optional string array\",\"root\":\"optional string; must match stored root\"}},",
             "{\"name\":\"search\",\"params\":{\"limit\":\"optional u64 default 20\",\"query\":\"string\"}},",

@@ -174,7 +174,7 @@ The daemon serves newline-delimited JSON-RPC-like requests over stdio and platfo
 ```text
 methods  -> returns protocol version and available method names
 ping     -> returns {"status":"ok"}
-index_status -> params {"root":"optional; must match stored root","exclude_names":["optional"]}; returns needs_refresh and change counts without saving
+index_status -> params {"root":"optional with stored root metadata (if supplied, must match); otherwise required","exclude_names":["optional"]}; returns needs_refresh and change counts without saving
 refresh  -> params {"root":"optional; must match stored root","exclude_names":["optional"]}
 reindex  -> alias of refresh
 stats    -> returns saved-index file and byte totals

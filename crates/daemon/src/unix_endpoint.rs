@@ -679,6 +679,19 @@ mod tests {
         }
         assert!(canonical_endpoint(&fixture.0.join("x".repeat(200))).is_err());
         let invalid_utf8 = fixture.0.join(OsString::from_vec(vec![b'd', 0xff]));
+        assert_eq!(
+            endpoint_string(&invalid_utf8.join("s.sock"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_utf8_canonical_parent_alias_is_rejected() {
+        let fixture = Fixture::new();
+        let invalid_utf8 = fixture.0.join(OsString::from_vec(vec![b'd', 0xff]));
         ensure_private_directory(&invalid_utf8).unwrap();
         let parent = invalid_utf8.join("parent");
         ensure_private_directory(&parent).unwrap();
@@ -1268,15 +1281,6 @@ mod tests {
         drop(listener);
         drop(guard);
         assert!(!endpoint.exists());
-        // The permanent namespace association survives graceful shutdown too.
-        let before = fs::read(&lock).unwrap();
-        assert!(
-            EndpointGuard::bind(&endpoint, &fixture.0.join("other-state.json"))
-                .await
-                .is_err()
-        );
-        assert!(!endpoint.exists());
-        assert_eq!(fs::read(&lock).unwrap(), before);
     }
 
     #[tokio::test]

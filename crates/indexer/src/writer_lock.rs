@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 /// The adjacent lock file stays on disk after release: unlinking it could let
 /// another process lock a different inode while an existing owner still runs.
 pub struct IndexWriterGuard {
-    _file: File,
+    lock_file: File,
     index_path: PathBuf,
     lock_path: PathBuf,
 }
@@ -49,7 +49,7 @@ impl IndexWriterGuard {
         }
         match file.try_lock() {
             Ok(()) => Ok(Self {
-                _file: file,
+                lock_file: file,
                 index_path,
                 lock_path,
             }),
@@ -68,6 +68,13 @@ impl IndexWriterGuard {
     #[must_use]
     pub fn lock_path(&self) -> &Path {
         &self.lock_path
+    }
+}
+
+impl Drop for IndexWriterGuard {
+    fn drop(&mut self) {
+        // A concurrent fork can retain this open file description until exec.
+        let _ = self.lock_file.unlock();
     }
 }
 
@@ -130,5 +137,39 @@ fn resolve_existing_ancestor(path: &Path) -> io::Result<PathBuf> {
             Ok(resolve_existing_ancestor(parent)?.join(name))
         }
         Err(error) => Err(error),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn dropping_writer_releases_lock_with_a_duplicate_descriptor_alive() {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "aifs-writer-duplicate-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&path).unwrap();
+        let index = path.join("index.txt");
+        let guard = IndexWriterGuard::acquire(&index).unwrap();
+        // dup and fork share flock ownership through the open file description.
+        let inherited = guard.lock_file.try_clone().unwrap();
+        assert_eq!(
+            IndexWriterGuard::acquire(&index).err().unwrap().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(guard);
+        let replacement = IndexWriterGuard::acquire(&index).unwrap();
+        drop(inherited);
+        assert_eq!(
+            IndexWriterGuard::acquire(&index).err().unwrap().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(replacement);
+        fs::remove_dir_all(path).unwrap();
     }
 }

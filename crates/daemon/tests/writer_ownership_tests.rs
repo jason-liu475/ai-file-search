@@ -1,5 +1,7 @@
 use std::fs;
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -472,10 +474,18 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("aifs-writer-{name}-{}-{nonce}", std::process::id()));
+        let path = if cfg!(unix) {
+            PathBuf::from("/tmp").join(format!("aifs-wo-{}-{nonce:x}", std::process::id()))
+        } else {
+            std::env::temp_dir().join(format!("aifs-writer-{name}-{}-{nonce}", std::process::id()))
+        };
+        fs::create_dir(&path).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        #[cfg(unix)]
+        let path = fs::canonicalize(path).unwrap();
         let root = path.join("root");
-        fs::create_dir_all(&root).unwrap();
+        fs::create_dir(&root).unwrap();
         let index = root.join("index.txt");
         let mut guard = IndexWriterGuard::acquire(&index).unwrap();
         let mut store = FileIndexWriter::new(&mut guard);

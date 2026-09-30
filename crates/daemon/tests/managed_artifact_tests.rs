@@ -1,9 +1,11 @@
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ai_file_search_daemon::service::SERVICE_STATE_ENV;
+use ai_file_search_daemon::service::{SERVICE_STATE_ENV, read_state};
 use ai_file_search_daemon::{handle_json_line, send_ipc_request};
 use ai_file_search_indexer::{
     FileIndexStore, FileIndexWriter, IndexWriterGuard, ScanOptions, Scanner,
@@ -45,60 +47,66 @@ async fn check_managed_artifacts(relative_state: bool) {
         .unwrap();
     assert!(start.success(), "{}", fs::read_to_string(&stderr).unwrap());
     assert!(fixture.root.join("owned.runtime").is_file());
+    let managed_state = read_state(&fixture.root.join("owned.runtime"))
+        .unwrap()
+        .expect("start must publish its actual endpoint");
+    assert_eq!(managed_state.endpoint, fixture.endpoint);
+    let endpoint = &managed_state.endpoint;
+    #[cfg(unix)]
+    let endpoint_marker = {
+        let socket = Path::new(endpoint);
+        assert_eq!(socket.parent().unwrap(), fixture.root);
+        let marker = socket.with_file_name(format!(
+            ".{}.aifs-endpoint.lock",
+            socket.file_name().unwrap().to_str().unwrap()
+        ));
+        assert!(marker.is_file());
+        (marker.clone(), fs::read(marker).unwrap())
+    };
     let state_temporary = fixture.root.join(".owned.runtime.aifs-tmp-abandoned.tmp");
     fs::write(&state_temporary, "reserved service temporary").unwrap();
     let before = fs::read(&fixture.index).unwrap();
     assert_eq!(
-        rpc(&fixture.endpoint, "stats", json!({})).await,
+        rpc(endpoint, "stats", json!({})).await,
         json!({"files": 4, "total_bytes": 16})
     );
-    let before_search = rpc(
-        &fixture.endpoint,
-        "search",
-        json!({"query":"owned.runtime"}),
-    )
-    .await;
+    let before_search = rpc(endpoint, "search", json!({"query":"owned.runtime"})).await;
     assert_eq!(
-        rpc(&fixture.endpoint, "index_status", json!({})).await,
+        rpc(endpoint, "index_status", json!({})).await,
         summary(0, 4)
     );
     assert_eq!(fs::read(&fixture.index).unwrap(), before);
     for method in ["refresh", "reindex"] {
         let mut expected = summary(0, 4);
         expected.as_object_mut().unwrap().remove("needs_refresh");
-        assert_eq!(rpc(&fixture.endpoint, method, json!({})).await, expected);
+        assert_eq!(rpc(endpoint, method, json!({})).await, expected);
         assert_eq!(fs::read(&fixture.index).unwrap(), before);
     }
     assert_eq!(
-        rpc(
-            &fixture.endpoint,
-            "search",
-            json!({"query":"owned.runtime"})
-        )
-        .await,
+        rpc(endpoint, "search", json!({"query":"owned.runtime"})).await,
         before_search
     );
     assert_eq!(
-        rpc(&fixture.endpoint, "stats", json!({})).await,
+        rpc(endpoint, "stats", json!({})).await,
         json!({"files": 4, "total_bytes": 16})
     );
     fs::write(fixture.root.join("added.txt"), "added").unwrap();
     let mut expected = summary(1, 4);
     expected.as_object_mut().unwrap().remove("needs_refresh");
-    assert_eq!(rpc(&fixture.endpoint, "refresh", json!({})).await, expected);
+    assert_eq!(rpc(endpoint, "refresh", json!({})).await, expected);
     assert_eq!(
-        rpc(&fixture.endpoint, "index_status", json!({})).await,
+        rpc(endpoint, "index_status", json!({})).await,
         summary(0, 5)
     );
     let store = FileIndexStore::open(&fixture.index).unwrap();
     assert_saved_scope(&store, &state_temporary);
+    #[cfg(unix)]
+    {
+        assert!(store.search_by_name("aifs-endpoint.lock").is_empty());
+        assert_eq!(fs::read(&endpoint_marker.0).unwrap(), endpoint_marker.1);
+    }
     assert_eq!(
-        rpc(
-            &fixture.endpoint,
-            "search",
-            json!({"query":"owned.runtime"})
-        )
-        .await["files"]
+        rpc(endpoint, "search", json!({"query":"owned.runtime"})).await["files"]
             .as_array()
             .unwrap()
             .len(),
@@ -222,10 +230,23 @@ impl Fixture {
             "aifs-managed-artifact-{}-{nonce}-{relative}",
             std::process::id()
         );
+        #[cfg(windows)]
         let path = std::env::temp_dir().join(&name);
+        #[cfg(unix)]
+        let path = PathBuf::from("/tmp").join(format!(
+            "aifs-ma-{}-{nonce:x}-{relative}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        #[cfg(unix)]
+        let path = fs::canonicalize(path).unwrap();
         let root = path.join("root");
         fs::create_dir_all(root.join("elsewhere")).unwrap();
         fs::create_dir_all(root.join("target")).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         for file in [
             "kept.txt",
             "ordinary.tmp",
@@ -256,7 +277,7 @@ impl Fixture {
         let endpoint = if cfg!(windows) {
             name
         } else {
-            path.join("service.sock").to_string_lossy().into_owned()
+            root.join("s.sock").to_string_lossy().into_owned()
         };
         Self {
             path,

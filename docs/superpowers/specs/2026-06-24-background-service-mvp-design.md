@@ -1,6 +1,6 @@
 # Background Service MVP Design
 
-Reviewed: 2026-09-30. The managed-process MVP and Task 5a ownership, bounded-health-I/O, atomic-state and error-status safeguards are implemented with Windows verification. Private endpoint ACL/runtime-directory checks, stale Unix endpoint recovery and native Linux/macOS acceptance remain Task 5b; those contracts below are not yet completed. They are prerequisites for unattended automatic refresh.
+Reviewed: 2026-09-30. The managed-process MVP and Task 5a ownership, bounded-health-I/O, atomic-state and error-status safeguards are implemented. Task 5b adds private endpoint ACL/runtime-directory checks and verified stale Unix recovery. Native platform acceptance is tracked in the automatic-refresh implementation plan and must not be inferred from source code alone. These are prerequisites for unattended automatic refresh.
 
 ## Goal
 
@@ -67,7 +67,7 @@ This approach is preferred because it:
 Behavior:
 
 1. Resolve `index-file` to an absolute path.
-2. Resolve the exact state path, including `AIFS_SERVICE_STATE`, and the endpoint into a private per-user namespace. The prototype default remains `aifs-service`; the hardened Unix default must be an absolute path under a private runtime directory, and Windows needs first-instance protection and current-user access restrictions.
+2. Resolve the exact state path, including `AIFS_SERVICE_STATE`, and the endpoint into a private per-user namespace. The input default label is `aifs-service`, resolved to a user-SID pipe name on Windows and a state-path-derived socket under a validated private runtime directory on Unix. Use the endpoint recorded by the running service; older/default labels are not interchangeable with the resolved endpoint.
 3. Hold a short-lived startup coordination guard; inspect child-lifetime ownership separately. This lets the child acquire its lifetime guard before the parent publishes state and releases startup coordination, with no unowned handoff window.
 4. If state exists and structured `ping` identity matches active instance ownership, verify that the requested index/endpoint/interval matches before reporting already running. A mismatch fails and requires stop/start rather than pretending a new configuration took effect.
 5. A failed or timed-out `ping` is unknown/busy, not proof of stale state. If startup or child-lifetime ownership is held, do not replace state, unlink the endpoint, or spawn a duplicate. Malformed state is an explicit error.
@@ -293,7 +293,7 @@ This MVP exposes local-only IPC, not HTTP. The service endpoint is intended for 
 
 Security-sensitive follow-ups:
 
-- Restrict Named Pipe and Unix Socket permissions before production or unattended use; use private per-user directories/namespaces. Task 5a implements Windows first-instance and remote-client rejection but no custom current-user ACL, and Unix socket mode `0600` but no validated private runtime directory.
+- Managed pipes apply a protected current-process-user DACL at each instance creation and reject remote clients. Managed Unix endpoints validate private owned directories, retain persistent endpoint ownership and only recover unchanged recorded sockets with definitive connection refusal. Normal exit removes only the owned socket identity. Verify native permission/collision tests before unattended use; the legacy manual `ipc` loop is not hardened by these managed controls.
 - Never unlink a pre-existing endpoint without verified ownership, socket-type inspection, and safe stale detection.
 - Add an optional per-user token or peer-credential check.
 - Define a separate safe read-only API profile for AI clients.

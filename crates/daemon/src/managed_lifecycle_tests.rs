@@ -2,6 +2,97 @@ use super::*;
 use std::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
+#[cfg(windows)]
+#[test]
+fn complete_pipe_prefix_is_case_insensitive_without_double_prefixing() {
+    for endpoint in [r"\\.\pipe\custom", r"\\.\PIPE\custom", r"\\.\PiPe\custom"] {
+        assert_eq!(pipe_name(endpoint), endpoint);
+    }
+    assert_eq!(pipe_name("custom"), r"\\.\pipe\custom");
+    assert_eq!(pipe_name(""), r"\\.\pipe\");
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn owned_legacy_acl_requires_restart_but_remains_stoppable() {
+    use tokio::net::windows::named_pipe::ServerOptions;
+    let fixture = Fixture::new("legacy-acl");
+    let mut guard = IndexWriterGuard::acquire(&fixture.index).unwrap();
+    let mut writer = FileIndexWriter::new(&mut guard);
+    writer.set_root_path(fixture.path.clone());
+    writer.save().unwrap();
+    let state_path = fixture.path.join("state.json");
+    let instance = ServiceInstanceGuard::acquire(&state_path).unwrap();
+    let mut state = test_identity(guard.index_path());
+    state.endpoint = fixture.path.file_name().unwrap().to_str().unwrap().into();
+    write_state(&state_path, &state).unwrap();
+    let before = fs::read(&state_path).unwrap();
+    let endpoint = pipe_name(&state.endpoint);
+    let mut pending = ServerOptions::new()
+        .first_pipe_instance(true)
+        .reject_remote_clients(true)
+        .create(&endpoint)
+        .unwrap();
+    let identity = service_identity(&state);
+    let worker = tokio::spawn(async move {
+        let _ownership = (guard, instance);
+        loop {
+            if pending.connect().await.is_err() {
+                let _ = pending.disconnect();
+                tokio::task::yield_now().await;
+                continue;
+            }
+            let next = ServerOptions::new().create(&endpoint).unwrap();
+            let mut connected = std::mem::replace(&mut pending, next);
+            let Ok(line) = bounded_io::read_request(&mut connected).await else {
+                continue;
+            };
+            let request = Request::from_json_line(&line).unwrap();
+            let shutdown = request.method == "shutdown";
+            let result = if shutdown {
+                json!({"status":"shutting_down"})
+            } else {
+                json!({"status":"ok","service":identity})
+            };
+            bounded_io::write_response(
+                &mut connected,
+                &Response::success(request.id, result).to_json_line(),
+            )
+            .await
+            .unwrap();
+            if shutdown {
+                break;
+            }
+        }
+    });
+    let started = service_start(
+        &[
+            fixture.index.to_str().unwrap().into(),
+            "--endpoint".into(),
+            state.endpoint.clone(),
+        ],
+        &state_path,
+    )
+    .await;
+    let preserved = fs::read(&state_path);
+    let active = ServiceCoordination::instance_active(&state_path);
+    let stopped = service_stop(&state_path).await;
+    worker.abort();
+    let _ = worker.await;
+    assert_eq!(started.exit_code, 1);
+    assert!(
+        started.stderr.contains("security upgrade required"),
+        "{}",
+        started.stderr
+    );
+    assert!(started.stderr.contains("stop/start"));
+    assert_eq!(preserved.unwrap(), before);
+    assert!(active.unwrap());
+    assert_eq!(stopped.exit_code, 0, "{}", stopped.stderr);
+    assert!(!state_path.exists());
+    assert!(IndexWriterGuard::acquire(&fixture.index).is_ok());
+}
+
 #[test]
 fn health_response_requires_structured_success_with_matching_id() {
     for line in [

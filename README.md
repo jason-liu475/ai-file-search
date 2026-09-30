@@ -20,7 +20,7 @@ The CLI and local daemon are usable for experiments. They are not yet a producti
 
 Automatic refresh is configuration-only at commit `fd2f6a9`: `--auto-refresh-seconds` is parsed and recorded, but `service-run` does not schedule scans yet. Use manual `refresh` until runtime implementation and acceptance tests are complete.
 
-The [reviewed automatic-refresh design](docs/superpowers/specs/2026-07-10-service-auto-refresh-design.md) and [implementation plan](docs/superpowers/plans/2026-07-10-service-auto-refresh.md) separate completed configuration, scan-policy persistence, writer isolation, streaming publication/loading, borrowed comparison and Task 5a lifecycle safeguards from pending private-endpoint access control, scheduling, and platform/performance gates.
+The [reviewed automatic-refresh design](docs/superpowers/specs/2026-07-10-service-auto-refresh-design.md) and [implementation plan](docs/superpowers/plans/2026-07-10-service-auto-refresh.md) separate configuration, scan-policy persistence, writer isolation, streaming publication/loading, borrowed comparison and managed lifecycle/endpoint safeguards from pending scheduling and platform/performance gates.
 
 ## Quick Start
 
@@ -122,10 +122,10 @@ echo '{"id":1,"method":"methods","params":{}}' | cargo run -p ai-file-search-dae
 
 Run the daemon as a user-level background service:
 
-```bash
+```powershell
 cargo run -p ai-file-search-daemon -- service start ./tmp-index.txt
-cargo run -p ai-file-search-daemon -- service status --json
-echo '{"id":1,"method":"stats","params":{}}' | cargo run -p ai-file-search-daemon -- ipc-request aifs-service
+$service = cargo run -p ai-file-search-daemon -- service status --json | ConvertFrom-Json
+'{"id":1,"method":"stats","params":{}}' | cargo run -p ai-file-search-daemon -- ipc-request $service.endpoint
 cargo run -p ai-file-search-daemon -- service stop
 ```
 
@@ -168,6 +168,9 @@ Current behavior:
 - `ai-file-search-daemon ipc` serves the same JSON-RPC protocol over Windows Named Pipe or Unix Domain Socket for local long-lived clients.
 - `ai-file-search-daemon ipc-request` sends one newline-delimited JSON-RPC request to a local IPC endpoint, either from stdin or the optional command argument.
 - `ai-file-search-daemon service start/status/stop` manages a user-level background daemon over the platform IPC transport.
+- Managed Windows pipes apply a protected current-process-user DACL at creation for every instance, reject remote clients, and reserve the first instance. The default resolves to `aifs-service-<user-SID>`; explicit pipe names are unchanged and full local prefixes are case-insensitive. Reusing an existing instance also validates its actual descriptor; an older/default DACL requires stop/start, without changing a live endpoint's ACL. Stop remains available for the older owned instance. Use the endpoint reported in service state/status, not the unresolved default label.
+- Managed Unix endpoints use an owned private `0700` directory and `0600` socket. The default uses a validated absolute `XDG_RUNTIME_DIR` when supplied, otherwise a private per-user temporary runtime directory, with a state-path-derived socket name. Custom endpoints must be absolute and have an existing private owned parent. Unsafe existing directories are rejected, not repaired by changing their permissions.
+- Unix endpoint ownership uses a persistent adjacent lock and socket device/inode/state-owner record. Stale recovery requires the recorded socket and canonical state owner to match, ownership to be available and a definitive connection refusal. Live, unknown, timed-out, unrecorded, replaced, non-socket and linked paths are not deleted. Keep the lock file after exit; a gracefully removed endpoint can be rebound by a different state owner without replacing the lock.
 - Managed connections accept one newline-terminated UTF-8 request (at most 64 KiB including newline), write one response, then close. Read and response-write deadlines are each 5 seconds; idle, trickling, oversized, malformed, and disconnected clients do not stop the managed server. Reconnect for the next request. Stdio keeps its multi-request behavior; manually started `ipc` retains its separate legacy transport semantics.
 - Service-management health/shutdown transactions have a 5-second total connect/write/read budget and a 1 MiB response cap. Health uses parsed response identity, not string matching. The startup readiness loop has a 2-second total budget; timeouts or identity mismatches never authorize replacement of a live instance.
 - Persistent `<state-filename>.startup.lock` and `<state-filename>.instance.lock` distinguish coordinated state transitions from the child lifetime. Do not unlink these files to clear contention. Matching index/endpoint/interval returns the existing instance; changing configuration requires stop/start. CLI stop verifies the persisted child-generated `instance_id` and startup timestamp, waits for instance/index release and removes only matching state, never killing a saved PID. Legacy state without `instance_id` remains readable but cannot claim a newer managed instance by PID alone.
@@ -180,7 +183,7 @@ Current behavior:
 - CLI `index`/`refresh` and direct/stdio RPC writes acquire one nonblocking writer lock before opening or scanning. Manual IPC and managed service processes hold it for their entire lifetime and reuse it for their own refresh requests. External writes fail with `index is busy`; query/stat/status reads do not acquire this lock. Send refresh to the owning service or stop it before using CLI writes.
 - `<index-filename>.lock` remains beside the index after exit. Do not delete it to clear contention: the OS releases ownership when the process exits. Scanning excludes this index, its lock and its adjacent `.<index-filename>.aifs-tmp-*` publication namespace, not arbitrary `.tmp` files.
 - Snapshot save streams into an exclusively created same-directory temporary file, flushes/syncs/closes it, then replaces the destination without deleting the old index first. A failure before replacement preserves the old bytes and cleans only this attempt's temporary file. A crash can leave a reserved temporary artifact; it is not indexed or reused.
-- Managed RPC scans also exclude the actual service-state file, its startup/instance locks, and each artifact's adjacent `.<filename>.aifs-tmp-*` publication namespace, including a relative `AIFS_SERVICE_STATE` resolved at startup and explicitly forwarded to the child. This is path-scoped, not a generic `service-state.json` or `.tmp` filter. Direct/stdio/manual IPC calls have no managed-state context and do not guess which user files to hide.
+- Managed RPC scans also exclude the actual service-state file, its startup/instance locks, the Unix endpoint ownership lock, and each artifact's adjacent `.<filename>.aifs-tmp-*` publication namespace, including a relative `AIFS_SERVICE_STATE` resolved at startup and explicitly forwarded to the child. This is path-scoped, not a generic `service-state.json` or `.tmp` filter. Direct/stdio/manual IPC calls have no managed-state context and do not guess which user files to hide.
 - Manual `refresh`/`reindex` still publish explicitly even with zero file changes. The shared refresh operation has a tested conditional-publication mode for the future scheduler, but no automatic timer is connected yet. `index_status` uses the same scan/compare path and never publishes.
 
 ## JSON-RPC Methods
@@ -211,8 +214,8 @@ Managed `ping` adds `result.service` with PID, index path, endpoint, configured 
 - `stats` avoids rescanning the filesystem root, but currently still loads and parses the entire saved index; it is not a constant-time metadata lookup.
 - Writer locking resolves existing index paths and canonical parents of new paths, including supported relative/absolute and parent-symlink aliases. Hard-link index aliases, older/noncooperating writers, network-filesystem guarantees, and hostile directories are unsupported. Keep index/state/endpoint files in a trusted user-controlled directory; a cooperative lock is not authorization.
 - New Unix lock/publication files request mode `0600`; Windows files inherit the destination directory ACL. No custom Windows ACL or preservation of an old file-specific ACL is promised. Atomic replacement/power-loss durability and concurrent-client behavior still need native Linux/macOS acceptance; current verification is Windows-only.
-- OS service installation, start-on-login, authentication, and multi-user access controls are not implemented yet.
-- Managed Windows pipes use first-instance protection, reject remote clients, and retain a pending instance between requests, but a custom current-user ACL is not implemented. Managed Unix sockets request mode `0600`, refuse every pre-existing path, and remove only their own socket identity on normal exit; the default currently resolves beside the state file. A validated private runtime directory, endpoint ownership/stale recovery and native Unix acceptance remain Task 5b gates. After a crash, a stale Unix socket is rejected rather than automatically unlinked. Legacy manual `ipc` has not received these managed lifecycle guarantees. Local-only transport does not authorize callers or isolate users.
+- OS service installation, start-on-login, per-application authentication and read-only AI-client authorization are not implemented yet. Endpoint ACLs/private directories separate ordinary OS users; arbitrary code running as the same user and privileged administrators are outside that boundary. Keep index/state directories trusted.
+- Managed transports retain a pending Windows instance or Unix listener. The small `ai-file-search-platform` crate is the audited Windows native-API boundary; all existing application crates retain `unsafe_code = forbid`. Legacy manual `ipc` has not received the managed access-control/lifecycle guarantees. Native CI is configured for Windows, Linux and macOS; configured jobs are not themselves evidence of passing acceptance.
 - Full scans are synchronous and serial. The transport deadlines do not cancel a scan or guarantee response latency during indexing. Frame limits do not cap metadata or search-response allocations.
 - Content indexing is not implemented yet.
 - Desktop UI and a production-safe AI authorization profile are planned after the CLI/core path is stable; the prototype local JSON-RPC API already exists.

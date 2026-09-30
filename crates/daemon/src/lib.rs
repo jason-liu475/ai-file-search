@@ -1,6 +1,9 @@
 mod bounded_io;
 pub mod service;
 
+#[cfg(unix)]
+mod unix_endpoint;
+
 #[cfg(test)]
 mod managed_lifecycle_tests;
 #[cfg(test)]
@@ -328,6 +331,13 @@ async fn service_start(args: &[String], state_path: &Path) -> CliResult {
                     return lifecycle_error(
                         "service configuration mismatch",
                         "stop the running service before changing index, endpoint, or interval",
+                    );
+                }
+                #[cfg(windows)]
+                if let Err(error) = verify_reused_managed_endpoint(&state.endpoint).await {
+                    return lifecycle_error(
+                        "service endpoint security upgrade required; stop/start the service",
+                        error,
                     );
                 }
                 return service_running_result(&state);
@@ -685,16 +695,18 @@ fn resolve_managed_endpoint(endpoint: &str, state_path: &Path) -> io::Result<Str
     #[cfg(windows)]
     {
         let _ = state_path;
-        Ok(endpoint.to_owned())
+        if endpoint == DEFAULT_ENDPOINT {
+            Ok(format!(
+                "{DEFAULT_ENDPOINT}-{}",
+                ai_file_search_platform::current_user_sid()?
+            ))
+        } else {
+            Ok(endpoint.to_owned())
+        }
     }
     #[cfg(unix)]
     {
-        let path = if endpoint == DEFAULT_ENDPOINT {
-            state_path.with_file_name("service.sock")
-        } else {
-            std::path::absolute(endpoint)?
-        };
-        Ok(path.to_string_lossy().into_owned())
+        unix_endpoint::resolve(endpoint, state_path)
     }
 }
 
@@ -713,16 +725,7 @@ async fn send_managed_request(endpoint: &str, request: &str) -> io::Result<Strin
     timeout(bounded_io::IO_TIMEOUT, async {
         #[cfg(windows)]
         {
-            use tokio::net::windows::named_pipe::ClientOptions;
-            let stream = loop {
-                match ClientOptions::new().open(pipe_name(endpoint)) {
-                    Ok(stream) => break stream,
-                    Err(error) if error.raw_os_error() == Some(231) => {
-                        sleep(Duration::from_millis(10)).await;
-                    }
-                    Err(error) => return Err(error),
-                }
-            };
+            let stream = open_managed_pipe(endpoint).await?;
             bounded_io::send_request(stream, request).await
         }
         #[cfg(unix)]
@@ -733,6 +736,32 @@ async fn send_managed_request(endpoint: &str, request: &str) -> io::Result<Strin
     })
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "service request timed out"))?
+}
+
+#[cfg(windows)]
+async fn open_managed_pipe(
+    endpoint: &str,
+) -> io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    loop {
+        match ClientOptions::new().open(pipe_name(endpoint)) {
+            Ok(stream) => return Ok(stream),
+            Err(error) if error.raw_os_error() == Some(231) => {
+                sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(windows)]
+async fn verify_reused_managed_endpoint(endpoint: &str) -> io::Result<()> {
+    timeout(bounded_io::IO_TIMEOUT, async {
+        let stream = open_managed_pipe(endpoint).await?;
+        ai_file_search_platform::verify_private_pipe_client(&stream)
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "pipe policy check timed out"))?
 }
 
 pub async fn service_run(
@@ -782,7 +811,13 @@ pub async fn service_run(
         auto_refresh_seconds,
         instance_id: Some(new_instance_id()),
     };
-    let result = serve_managed_ipc(&mut guard, &identity, &instance.artifact_paths()).await;
+    let result = serve_managed_ipc(
+        &mut guard,
+        &identity,
+        &instance.artifact_paths(),
+        &state_path,
+    )
+    .await;
     // Release the index before instance ownership: absence of instance ownership
     // is used by stop to confirm that this child's writer has finished.
     drop(guard);
@@ -844,13 +879,10 @@ async fn serve_managed_ipc(
     guard: &mut IndexWriterGuard,
     identity: &ServiceState,
     artifacts: &[PathBuf],
+    _state_path: &Path,
 ) -> io::Result<()> {
-    use tokio::net::windows::named_pipe::ServerOptions;
     let endpoint = pipe_name(&identity.endpoint);
-    let mut pending = ServerOptions::new()
-        .first_pipe_instance(true)
-        .reject_remote_clients(true)
-        .create(&endpoint)?;
+    let mut pending = ai_file_search_platform::create_private_pipe(&endpoint, true)?;
     loop {
         if let Err(error) = pending.connect().await {
             if error.kind() == io::ErrorKind::Interrupted {
@@ -872,9 +904,7 @@ async fn serve_managed_ipc(
         }
         // Keep an unconnected instance alive while the serial owner serves or scans.
         // This also preserves the endpoint namespace continuously between requests.
-        let next = ServerOptions::new()
-            .reject_remote_clients(true)
-            .create(&endpoint)?;
+        let next = ai_file_search_platform::create_private_pipe(&endpoint, false)?;
         let connected = std::mem::replace(&mut pending, next);
         if matches!(
             handle_managed_connection(guard, connected, identity, artifacts).await,
@@ -890,37 +920,16 @@ async fn serve_managed_ipc(
     guard: &mut IndexWriterGuard,
     identity: &ServiceState,
     artifacts: &[PathBuf],
+    state_path: &Path,
 ) -> io::Result<()> {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
-    struct OwnedSocket {
-        path: PathBuf,
-        device: u64,
-        inode: u64,
-    }
-    impl Drop for OwnedSocket {
-        fn drop(&mut self) {
-            if let Ok(metadata) = std::fs::symlink_metadata(&self.path)
-                && metadata.file_type().is_socket()
-                && metadata.dev() == self.device
-                && metadata.ino() == self.inode
-            {
-                let _ = std::fs::remove_file(&self.path);
-            }
-        }
-    }
-    // A pre-existing socket or ordinary file is not ours to unlink.
-    let listener = tokio::net::UnixListener::bind(&identity.endpoint)?;
-    let metadata = std::fs::symlink_metadata(&identity.endpoint)?;
-    let _socket = OwnedSocket {
-        path: PathBuf::from(&identity.endpoint),
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    };
-    std::fs::set_permissions(&identity.endpoint, std::fs::Permissions::from_mode(0o600))?;
+    let (endpoint_guard, listener) =
+        unix_endpoint::EndpointGuard::bind(Path::new(&identity.endpoint), state_path).await?;
+    let mut runtime_artifacts = artifacts.to_vec();
+    runtime_artifacts.extend(endpoint_guard.artifact_paths());
     loop {
         let (stream, _) = accept_with_retry(|| listener.accept()).await?;
         if matches!(
-            handle_managed_connection(guard, stream, identity, artifacts).await,
+            handle_managed_connection(guard, stream, identity, &runtime_artifacts).await,
             Ok(StreamStatus::ShutdownRequested)
         ) {
             return Ok(());
@@ -1419,7 +1428,10 @@ where
 #[cfg(windows)]
 fn pipe_name(endpoint: &str) -> String {
     const PIPE_PREFIX: &str = r"\\.\pipe\";
-    if endpoint.starts_with(PIPE_PREFIX) {
+    if endpoint
+        .get(..PIPE_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(PIPE_PREFIX))
+    {
         endpoint.to_owned()
     } else {
         format!("{PIPE_PREFIX}{endpoint}")

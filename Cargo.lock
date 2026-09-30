@@ -20,7 +20,9 @@ version = "0.1.0"
 dependencies = [
  "ai-file-search-core",
  "ai-file-search-indexer",
+ "ai-file-search-platform",
  "ai-file-search-protocol",
+ "rustix",
  "serde",
  "serde_json",
  "tokio",
@@ -34,12 +36,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ai-file-search-platform"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "windows-sys",
+]
+
+[[package]]
 name = "ai-file-search-protocol"
 version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "bitflags"
+version = "2.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
 name = "bytes"
@@ -68,6 +84,12 @@ name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+
+[[package]]
+name = "linux-raw-sys"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "memchr"
@@ -108,6 +130,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfbc457d0c7a0759a614551b11a6409e5951f6c7537be1f1b7682b9ae9230368"
 dependencies = [
  "proc-macro2",
+]
+
+[[package]]
+name = "rustix"
+version = "1.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
+dependencies = [
+ "bitflags",
+ "errno",
+ "libc",
+ "linux-raw-sys",
+ "windows-sys",
 ]
 
 [[package]]

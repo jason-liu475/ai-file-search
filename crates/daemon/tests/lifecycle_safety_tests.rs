@@ -2,6 +2,8 @@
 
 use std::fs;
 use std::io;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -656,8 +658,18 @@ impl Fixture {
             .as_nanos();
         let sequence = FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let name = format!("aifs-ls-{}-{nonce}-{sequence}", std::process::id());
+        #[cfg(windows)]
         let path = std::env::temp_dir().join(&name);
+        #[cfg(unix)]
+        let path = PathBuf::from("/tmp").join(format!(
+            "aifs-ls-{}-{nonce:x}-{sequence}",
+            std::process::id()
+        ));
         fs::create_dir(&path).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        #[cfg(unix)]
+        let path = fs::canonicalize(path).unwrap();
         let root = path.join("root");
         fs::create_dir(&root).unwrap();
         let index = path.join("index.txt");

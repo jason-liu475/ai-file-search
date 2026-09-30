@@ -1,5 +1,7 @@
 use std::fs;
 use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::Duration;
@@ -756,16 +758,35 @@ struct TestDir {
 
 impl TestDir {
     fn new(name: &str) -> Self {
+        #[cfg(not(unix))]
         let mut path = std::env::temp_dir();
+        #[cfg(unix)]
+        let mut path = PathBuf::from("/tmp");
+        #[cfg(not(unix))]
         path.push(format!(
             "ai-file-search-service-cli-{name}-{}",
             std::process::id()
         ));
+        #[cfg(unix)]
+        {
+            use std::hash::{DefaultHasher, Hash, Hasher};
+            let mut hash = DefaultHasher::new();
+            name.hash(&mut hash);
+            path.push(format!(
+                "aifs-sc-{}-{:x}",
+                std::process::id(),
+                hash.finish()
+            ));
+        }
 
         if path.exists() {
             fs::remove_dir_all(&path).expect("old fixture should be removable");
         }
         fs::create_dir_all(&path).expect("fixture directory should be created");
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        #[cfg(unix)]
+        let path = fs::canonicalize(path).unwrap();
 
         Self { path }
     }

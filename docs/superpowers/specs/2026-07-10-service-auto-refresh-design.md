@@ -4,7 +4,7 @@ Reviewed: 2026-09-30. This revision supersedes the original timer, storage, and 
 
 ## Implementation Status
 
-Implemented: interval parsing, child argument forwarding, startup-state rendering, scan-policy persistence, manual policy inheritance/mismatch rejection, explicit rebuilds, and configured-start root/policy validation. The current `service_run` uses the interval only for prerequisite validation, then calls the existing IPC server without scheduling scans. Scheduled refresh, writer isolation, bounded service connections, and the runtime status below are NOT implemented.
+Implemented: interval parsing, child argument forwarding, startup-state rendering, scan-policy persistence, manual policy inheritance/mismatch rejection, explicit rebuilds, configured-start root/policy validation, cross-process writer ownership, and unique streaming snapshot publication. The current `service_run` uses the interval only for prerequisite validation, then calls the existing IPC server without scheduling scans. Scheduled refresh, bounded service connections, and the runtime status below are NOT implemented. Native Windows verification is separate from pending Linux/macOS and performance acceptance.
 
 The configuration flag is not evidence that an automatic scan has run. Do not document this as an active feature until the implementation and platform acceptance gates pass.
 
@@ -67,12 +67,12 @@ Root equality uses filesystem-aware resolution, not raw string comparison. Rejec
 
 The serial service loop only prevents overlap WITHIN that process. CLI `index`/`refresh`, daemon `handle`/`stdio`/`ipc` writes, and another managed instance otherwise remain separate writers.
 
-Implement an RAII writer guard in the indexer/storage boundary:
+The indexer/storage boundary now implements an RAII writer guard:
 
 - Resolve one stable absolute index identity, canonicalizing existing paths and the parent of a new file. Document supported aliases; do not claim a path-based lock serializes hard-link aliases or hostile external writers.
 - Use an adjacent `<index>.lock` file with an OS exclusive lock. Open it read/write without truncation; use a nonblocking acquisition and report a busy index rather than waiting indefinitely.
-- The managed service holds the guard for its lifetime. Other supported writes acquire it BEFORE opening the old snapshot, scanning, comparing, and saving.
-- Reuse the held guard inside that service; do not recursively acquire an OS lock. All `FileIndexStore` mutation/publication paths must require ownership, not merely add locks to CLI wrappers.
+- Managed service and manually started IPC hold the guard for their lifetime. CLI, direct-handler and stdio writes acquire it BEFORE opening the old snapshot, scanning, comparing, and saving.
+- Those servers reuse their held guard instead of recursively acquiring an OS lock. `FileIndexStore` is a cloneable read-only snapshot. `FileIndexWriter::new/open` borrows `&mut IndexWriterGuard` and exposes mutation/save only for that guard's destination; it has neither `Clone` nor `DerefMut`. Queries, stats and index status still use read-only snapshots.
 - Keep the lock file in place after release. Unlinking a locked file permits a second lock identity on Unix.
 - The lock is cooperative coordination, not an access-control boundary. Index and lock files must live in an owner-controlled directory; reject unsafe file types. A process that bypasses the contract is unsupported.
 
@@ -82,12 +82,16 @@ Snapshot publication must:
 
 1. Finish scanning and comparing before mutating the published snapshot.
 2. Create a unique temporary file in the destination directory using exclusive `create_new`; retry a name collision without opening, truncating, or deleting an existing path.
-3. Stream borrowed entries through `BufWriter`, explicitly flush, then sync the file. Preserve private access permissions on the published file.
+3. Stream borrowed entries through `BufWriter`, explicitly flush, then sync the file. New Unix lock/temp files request mode `0600` (umask may further restrict); Windows inherits the trusted directory's ACL. This does not preserve an old index's custom file-specific ACL or establish caller authorization.
 4. Close handles as required by the platform and replace atomically on supported local filesystems. Never remove the old index first to work around a rename failure.
 5. On a pre-publication failure, preserve old index bytes and clean up only the temporary file created by this attempt.
 6. After publication, do not report a rollback that did not happen. Power-loss durability and network-filesystem lock/rename semantics are not guaranteed in this MVP.
 
 A fixed `<index>.tmp` is unacceptable: it permits write races and can follow a pre-existing link. Exclusive creation prevents that particular path-reuse problem; it is not a substitute for a private directory or writer isolation.
+
+Publication uses `.<index-filename>.aifs-tmp-<pid>-<counter>` with bounded exclusive-creation retries. Existing collisions/links and legacy `<index>.tmp` files are untouched. Owned temporaries are removed on ordinary pre-publication failure; process termination can leave a reserved artifact. `Scanner::scan_for_index` centrally excludes the resolved index, adjacent lock and same-directory reserved prefix without per-entry canonicalization or a blanket `.tmp` filter. Service-state self-exclusion is still part of Task 4/5, not this storage slice.
+
+Relative/absolute paths and resolvable parent aliases share ownership. An existing final symlink resolves to its target, and the writer publishes to that target. Path locks do not unify different hard-link names. Lock-path symlinks/nonregular types are rejected; protection against hostile directory replacement, writers ignoring locks and network-filesystem semantics is outside this contract. Existing readers may finish using the old snapshot while newly opened readers see the replacement on supported local filesystems.
 
 Exclude the exact index path, lock path, resolved service-state path, and owned temporary-file namespace when they lie under the scanned root. Do not exclude every file ending in `.tmp`. Pass the actual absolute state path from startup to the child context, including `AIFS_SERVICE_STATE` overrides, so self-exclusion cannot depend on a different working directory.
 
@@ -133,7 +137,7 @@ Share one private scan/compare operation with manual refresh and read-only index
 - On change, apply `replace_all` and the failure-safe `save()` contract while preserving root and policy.
 - `index_status` never calls mutation or save, and no polling call precedes an automatic scan.
 
-Current implementation costs include the parsed `BTreeMap`, cloned `all_files()` results, candidate `Vec`, two comparison maps, and whole-file string serialization. Serial execution does NOT remove these copies.
+Current implementation costs include the parsed `BTreeMap`, cloned `all_files()` results, candidate `Vec`, two comparison maps, and whole-file text loading. Save now streams borrowed records instead of collecting cloned records and a whole-file formatting buffer. Serial execution does NOT remove the remaining copies.
 
 Before claiming memory-conscious scheduled refresh, introduce borrowed ordered iteration, compare sorted entries without additional path maps/cloned snapshots, and stream load/save rather than buffering complete text files. Retain the old snapshot and candidate metadata required for correctness: scan peak remains O(N), while unchanged idle state has no loaded scan snapshot or watcher. Do not retain capacities of full scan buffers after returning to idle without measuring retained memory.
 

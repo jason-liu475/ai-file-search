@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 
 use ai_file_search_core::PathId;
 use ai_file_search_daemon::handle_json_line;
-use ai_file_search_indexer::{FileIndexStore, IndexedFile, ScanOptions, Scanner};
+use ai_file_search_indexer::{
+    FileIndexStore, FileIndexWriter, IndexWriterGuard, IndexedFile, ScanOptions, Scanner,
+};
 use ai_file_search_protocol::Response;
 
 #[test]
@@ -189,10 +191,13 @@ fn handler_reindexes_from_stored_root_when_root_param_is_omitted() {
         .expect("stored root fixture should be written");
 
     let index_path = fixture.path().join("index.txt");
-    let mut store = FileIndexStore::open(&index_path).expect("store should open");
+    let mut guard = IndexWriterGuard::acquire(&index_path).expect("writer should acquire");
+    let mut store = FileIndexWriter::open(&mut guard).expect("store should open");
     store.set_root_path(&root);
     store.replace_all(vec![indexed_file("stale.txt", 1, 1)]);
     store.save().expect("store should save");
+    drop(store);
+    drop(guard);
 
     let response = handle_json_line(&index_path, r#"{"id":9,"method":"reindex","params":{}}"#);
 
@@ -218,10 +223,13 @@ fn handler_rejects_refresh_root_that_differs_from_stored_root() {
         .expect("denied root fixture should be written");
 
     let index_path = fixture.path().join("index.txt");
-    let mut store = FileIndexStore::open(&index_path).expect("store should open");
+    let mut guard = IndexWriterGuard::acquire(&index_path).expect("writer should acquire");
+    let mut store = FileIndexWriter::open(&mut guard).expect("store should open");
     store.set_root_path(&allowed_root);
     store.replace_all(vec![indexed_file("stale.txt", 1, 1)]);
     store.save().expect("store should save");
+    drop(store);
+    drop(guard);
     let request = serde_json::json!({
         "id": 10,
         "method": "refresh",
@@ -701,10 +709,11 @@ fn policy_request(index_path: &Path, method: &str, params: serde_json::Value) ->
 }
 
 fn save_policy_index(index_path: &Path, root: &Path, options: ScanOptions) {
+    let mut guard = IndexWriterGuard::acquire(index_path).expect("writer should acquire");
     let files = Scanner::new(options.clone())
-        .scan(root)
+        .scan_for_index(root, guard.index_path())
         .expect("root should scan");
-    let mut store = FileIndexStore::open(index_path).expect("store should open");
+    let mut store = FileIndexWriter::new(&mut guard);
     store.set_root_path(root);
     store.set_scan_policy(options);
     store.replace_all(files);
@@ -757,16 +766,18 @@ impl Drop for TestDir {
 }
 
 fn save_index(index_path: &Path, files: Vec<IndexedFile>) {
-    let mut store = FileIndexStore::open(index_path).expect("store should open");
+    let mut guard = IndexWriterGuard::acquire(index_path).expect("writer should acquire");
+    let mut store = FileIndexWriter::new(&mut guard);
     store.replace_all(files);
     store.save().expect("store should save");
 }
 
 fn save_scanned_index(index_path: &Path, root: &Path) {
+    let mut guard = IndexWriterGuard::acquire(index_path).expect("writer should acquire");
     let files = Scanner::new(ScanOptions::default())
-        .scan(root)
+        .scan_for_index(root, guard.index_path())
         .expect("root fixture should scan");
-    let mut store = FileIndexStore::open(index_path).expect("store should open");
+    let mut store = FileIndexWriter::new(&mut guard);
     store.set_root_path(root);
     store.replace_all(files);
     store.save().expect("store should save");

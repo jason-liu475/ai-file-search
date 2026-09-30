@@ -1,13 +1,19 @@
 use std::collections::BTreeMap;
-use std::fs;
-use std::io;
+#[cfg(test)]
+use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufWriter, Write};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ai_file_search_core::PathId;
 
-use crate::{IndexedFile, ScanOptions};
+use crate::writer_lock::publication_prefix;
+use crate::{IndexWriterGuard, IndexedFile, ScanOptions};
 
 const INDEX_HEADER: &str = "aifs-index-v1";
+const TEMPORARY_CREATE_ATTEMPTS: usize = 32;
 
 #[derive(Clone, Debug, Default)]
 pub struct MemoryIndexStore {
@@ -122,6 +128,23 @@ fn file_name(file: &IndexedFile) -> &str {
         .unwrap_or_default()
 }
 
+/// An immutable, independently cloneable index snapshot.
+///
+/// Publication requires a [`FileIndexWriter`] borrowing an [`IndexWriterGuard`].
+///
+/// ```compile_fail
+/// use std::path::Path;
+/// use ai_file_search_indexer::FileIndexStore;
+/// let snapshot = FileIndexStore::new(Path::new("index.txt"));
+/// snapshot.save().unwrap();
+/// ```
+///
+/// ```compile_fail
+/// use std::path::Path;
+/// use ai_file_search_indexer::FileIndexStore;
+/// let mut snapshot = FileIndexStore::new(Path::new("index.txt"));
+/// snapshot.replace_all(Vec::new());
+/// ```
 #[derive(Clone, Debug)]
 pub struct FileIndexStore {
     path: PathBuf,
@@ -214,29 +237,9 @@ impl FileIndexStore {
         Ok(Self::new(path))
     }
 
-    pub fn upsert_file(&mut self, file: IndexedFile) {
-        self.memory.upsert_file(file);
-    }
-
-    pub fn replace_all(&mut self, files: Vec<IndexedFile>) {
-        self.memory.replace_all(files);
-    }
-
-    pub fn remove_path(&mut self, path: &PathId) {
-        self.memory.remove_path(path);
-    }
-
-    pub fn set_root_path(&mut self, root_path: impl AsRef<Path>) {
-        self.root_path = Some(root_path.as_ref().to_path_buf());
-    }
-
     #[must_use]
     pub fn root_path(&self) -> Option<&Path> {
         self.root_path.as_deref()
-    }
-
-    pub fn set_scan_policy(&mut self, options: ScanOptions) {
-        self.scan_policy = Some(options);
     }
 
     #[must_use]
@@ -278,43 +281,233 @@ impl FileIndexStore {
         self.memory.total_size_bytes()
     }
 
-    /// Saves the current index to disk.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the parent directory cannot be created or the index
-    /// file cannot be written.
-    pub fn save(&self) -> io::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let mut lines = vec![INDEX_HEADER.to_owned()];
-        if let Some(root_path) = &self.root_path {
-            lines.push(format_metadata_record("root", &root_path.to_string_lossy()));
-        }
-        if let Some(policy) = &self.scan_policy {
-            lines.push(format_metadata_record("scan_policy", "1"));
-            lines.extend(
-                policy
-                    .excluded_names()
-                    .map(|name| format_metadata_record("exclude_name", name)),
-            );
-        }
-        lines.extend(self.memory.all_files().iter().map(format_index_record));
-
-        let mut contents = lines.join("\n");
-        contents.push('\n');
-
-        let temporary_path = temporary_index_path(&self.path);
-        fs::write(&temporary_path, contents)?;
-        fs::rename(temporary_path, &self.path)
-    }
-
     #[must_use]
     pub fn search_by_name(&self, query: &str) -> Vec<IndexedFile> {
         self.memory.search_by_name(query)
     }
+}
+
+/// Exclusive mutation and publication access to an index snapshot.
+///
+/// The mutable guard borrow prevents overlapping writers; read APIs are available
+/// through immutable dereferencing. Cloning a reader never clones this capability.
+///
+/// ```compile_fail
+/// use std::path::Path;
+/// use ai_file_search_indexer::{FileIndexWriter, IndexWriterGuard};
+/// let mut guard = IndexWriterGuard::acquire(Path::new("index.txt")).unwrap();
+/// let first = FileIndexWriter::new(&mut guard);
+/// let second = FileIndexWriter::new(&mut guard);
+/// first.save().unwrap();
+/// second.save().unwrap();
+/// ```
+pub struct FileIndexWriter<'a> {
+    store: FileIndexStore,
+    _guard: &'a mut IndexWriterGuard,
+}
+
+impl<'a> FileIndexWriter<'a> {
+    /// Creates an empty rebuild without reading the previous snapshot.
+    #[must_use]
+    pub fn new(guard: &'a mut IndexWriterGuard) -> Self {
+        Self {
+            store: FileIndexStore::new(guard.index_path()),
+            _guard: guard,
+        }
+    }
+
+    /// Opens the snapshot at the guard's canonical destination.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same read or metadata errors as [`FileIndexStore::open`].
+    pub fn open(guard: &'a mut IndexWriterGuard) -> io::Result<Self> {
+        Ok(Self {
+            store: FileIndexStore::open(guard.index_path())?,
+            _guard: guard,
+        })
+    }
+
+    pub fn upsert_file(&mut self, file: IndexedFile) {
+        self.store.memory.upsert_file(file);
+    }
+
+    pub fn replace_all(&mut self, files: Vec<IndexedFile>) {
+        self.store.memory.replace_all(files);
+    }
+
+    pub fn remove_path(&mut self, path: &PathId) {
+        self.store.memory.remove_path(path);
+    }
+
+    pub fn set_root_path(&mut self, root_path: impl AsRef<Path>) {
+        self.store.root_path = Some(root_path.as_ref().to_path_buf());
+    }
+
+    pub fn set_scan_policy(&mut self, options: ScanOptions) {
+        self.store.scan_policy = Some(options);
+    }
+
+    /// Streams, flushes, syncs, and closes a unique adjacent temporary snapshot
+    /// before replacing the destination. No old-index unlink fallback is used.
+    ///
+    /// Requires a trusted local directory. Unix creation requests mode 0600;
+    /// Windows inherits directory ACLs. This is not a network-filesystem or
+    /// power-loss durability guarantee. Hard-link destination aliases and
+    /// hostile out-of-band writers are unsupported.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying create, write, flush, sync, or replacement error.
+    /// A pre-publication failure preserves the previous snapshot and attempts to
+    /// remove only this attempt's temporary file, after closing its handles.
+    pub fn save(&self) -> io::Result<()> {
+        self.save_with(&mut PublicationControl::default())
+    }
+
+    fn save_with(&self, control: &mut PublicationControl) -> io::Result<()> {
+        let (mut temporary, file) = create_temporary_file(&self.store.path, control)?;
+        {
+            // This scope closes all handles before failure cleanup on Windows.
+            let mut output = BufWriter::new(file);
+            writeln!(output, "{INDEX_HEADER}")?;
+            #[cfg(test)]
+            control.check(PublicationStage::Write)?;
+            if let Some(root_path) = &self.store.root_path {
+                write_metadata_record(&mut output, "root", &root_path.to_string_lossy())?;
+            }
+            if let Some(policy) = &self.store.scan_policy {
+                write_metadata_record(&mut output, "scan_policy", "1")?;
+                for name in policy.excluded_names() {
+                    write_metadata_record(&mut output, "exclude_name", name)?;
+                }
+            }
+            for file in self.store.memory.files.values() {
+                writeln!(
+                    output,
+                    "{}\t{}\t{}",
+                    file.size_bytes,
+                    file.modified_unix_seconds,
+                    file.relative_path.as_normalized()
+                )?;
+            }
+            #[cfg(test)]
+            control.check(PublicationStage::Flush)?;
+            output.flush()?;
+            #[cfg(test)]
+            control.check(PublicationStage::Sync)?;
+            output.get_ref().sync_all()?;
+        }
+        #[cfg(test)]
+        control.check(PublicationStage::Replace)?;
+        fs::rename(&temporary.path, &self.store.path)?;
+        temporary.remove_on_drop = false;
+        Ok(())
+    }
+}
+
+impl Deref for FileIndexWriter<'_> {
+    type Target = FileIndexStore;
+
+    fn deref(&self) -> &Self::Target {
+        &self.store
+    }
+}
+
+struct OwnedTemporary {
+    path: PathBuf,
+    remove_on_drop: bool,
+}
+
+impl Drop for OwnedTemporary {
+    fn drop(&mut self) {
+        if self.remove_on_drop {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[derive(Default)]
+struct PublicationControl {
+    #[cfg(test)]
+    failure: Option<PublicationStage>,
+    #[cfg(test)]
+    next_id: Option<u64>,
+}
+
+impl PublicationControl {
+    #[cfg(test)]
+    fn check(&self, stage: PublicationStage) -> io::Result<()> {
+        if self.failure == Some(stage) {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("injected {stage:?} failure"),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn next_temporary_id(control: &mut PublicationControl) -> u64 {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    #[cfg(test)]
+    if let Some(id) = control.next_id.as_mut() {
+        let next = *id;
+        *id = id.wrapping_add(1);
+        return next;
+    }
+    #[cfg(not(test))]
+    let _ = control;
+    NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublicationStage {
+    Create,
+    Write,
+    Flush,
+    Sync,
+    Replace,
+}
+
+fn create_temporary_file(
+    index_path: &Path,
+    control: &mut PublicationControl,
+) -> io::Result<(OwnedTemporary, File)> {
+    for _ in 0..TEMPORARY_CREATE_ATTEMPTS {
+        let path = temporary_index_path(index_path, next_temporary_id(control))?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        #[cfg(test)]
+        control.check(PublicationStage::Create)?;
+        match options.open(&path) {
+            Ok(file) => {
+                return Ok((
+                    OwnedTemporary {
+                        path,
+                        remove_on_drop: true,
+                    },
+                    file,
+                ));
+            }
+            // Windows reports access denied for an existing directory collision.
+            Err(error)
+                if error.kind() == io::ErrorKind::AlreadyExists
+                    || fs::symlink_metadata(&path).is_ok() => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "index temporary name collision limit reached",
+    ))
 }
 
 fn invalid_scan_policy() -> io::Error {
@@ -338,24 +531,18 @@ fn parse_root_metadata_record(line: &str) -> Option<PathBuf> {
     }
 }
 
-fn format_metadata_record(key: &str, value: &str) -> String {
-    ["meta", key, &escape_metadata_value(value)].join("\t")
-}
-
-fn escape_metadata_value(value: &str) -> String {
-    let mut escaped = String::new();
-
+fn write_metadata_record(output: &mut impl Write, key: &str, value: &str) -> io::Result<()> {
+    write!(output, "meta\t{key}\t")?;
     for character in value.chars() {
         match character {
-            '\\' => escaped.push_str("\\\\"),
-            '\t' => escaped.push_str("\\t"),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            character => escaped.push(character),
+            '\\' => output.write_all(b"\\\\")?,
+            '\t' => output.write_all(b"\\t")?,
+            '\n' => output.write_all(b"\\n")?,
+            '\r' => output.write_all(b"\\r")?,
+            character => write!(output, "{character}")?,
         }
     }
-
-    escaped
+    output.write_all(b"\n")
 }
 
 fn unescape_metadata_value(value: &str) -> String {
@@ -410,21 +597,256 @@ fn parse_index_record(line: &str, has_header: bool) -> IndexedFile {
     }
 }
 
-fn format_index_record(file: &IndexedFile) -> String {
-    [
-        file.size_bytes.to_string(),
-        file.modified_unix_seconds.to_string(),
-        file.relative_path.as_normalized().to_owned(),
-    ]
-    .join("\t")
+fn temporary_index_path(path: &Path, id: u64) -> io::Result<PathBuf> {
+    if path.file_name().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "index destination has no file name",
+        ));
+    }
+    let mut temporary_name = publication_prefix(path);
+    temporary_name.push(format!("{}-{id}", std::process::id()));
+    Ok(path.with_file_name(temporary_name))
 }
 
-fn temporary_index_path(path: &Path) -> PathBuf {
-    let mut temporary_path = path.to_owned();
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map_or_else(|| "tmp".to_owned(), |extension| format!("{extension}.tmp"));
-    temporary_path.set_extension(extension);
-    temporary_path
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+
+    const ORIGINAL: &[u8] = b"aifs-index-v1\nmeta\troot\tworkspace\n7\t1\told.txt\n";
+
+    fn check_failure(stage: PublicationStage) {
+        let fixture = TestDir::new(&format!("failure-{stage:?}"));
+        let index_path = fixture.path.join("index.txt");
+        fs::write(&index_path, ORIGINAL).unwrap();
+        let mut guard = IndexWriterGuard::acquire(&index_path).unwrap();
+        let unrelated = temporary_index_path(guard.index_path(), 99).unwrap();
+        fs::write(&unrelated, b"preexisting temporary contents").unwrap();
+        fs::write(fixture.path.join("index.txt.tmp"), b"old temp").unwrap();
+        let before = fixture.entries();
+        let mut writer = FileIndexWriter::open(&mut guard).unwrap();
+        writer.replace_all(vec![indexed_file("new.txt", 9, 2)]);
+        let mut control = PublicationControl {
+            failure: Some(stage),
+            next_id: Some(100),
+        };
+
+        let error = writer.save_with(&mut control).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), format!("injected {stage:?} failure"));
+        assert_eq!(fs::read(&index_path).unwrap(), ORIGINAL);
+        assert_eq!(fixture.entries(), before, "owned temp must be cleaned");
+        assert_eq!(
+            fs::read(unrelated).unwrap(),
+            b"preexisting temporary contents"
+        );
+        assert_eq!(
+            fs::read(fixture.path.join("index.txt.tmp")).unwrap(),
+            b"old temp"
+        );
+    }
+
+    #[test]
+    fn create_failure_preserves_snapshot_and_unrelated_files() {
+        check_failure(PublicationStage::Create);
+    }
+
+    #[test]
+    fn write_failure_preserves_snapshot_and_cleans_owned_temp() {
+        check_failure(PublicationStage::Write);
+    }
+
+    #[test]
+    fn flush_failure_preserves_snapshot_and_cleans_owned_temp() {
+        check_failure(PublicationStage::Flush);
+    }
+
+    #[test]
+    fn sync_failure_preserves_snapshot_and_cleans_owned_temp() {
+        check_failure(PublicationStage::Sync);
+    }
+
+    #[test]
+    fn replacement_failure_preserves_snapshot_and_cleans_owned_temp() {
+        check_failure(PublicationStage::Replace);
+    }
+
+    #[test]
+    fn exclusive_creation_retries_without_touching_collisions_or_hard_links() {
+        let fixture = TestDir::new("collisions-and-hard-links");
+        let index_path = fixture.path.join("index.txt");
+        fs::write(&index_path, ORIGINAL).unwrap();
+        let unrelated = fixture.path.join("unrelated.txt");
+        fs::write(&unrelated, b"unrelated contents").unwrap();
+        let mut guard = IndexWriterGuard::acquire(&index_path).unwrap();
+        let paths = (100..104)
+            .map(|id| temporary_index_path(guard.index_path(), id).unwrap())
+            .collect::<Vec<_>>();
+        fs::write(&paths[0], b"collision").unwrap();
+        fs::hard_link(&index_path, &paths[1]).unwrap();
+        fs::hard_link(&unrelated, &paths[2]).unwrap();
+        fs::create_dir(&paths[3]).unwrap();
+        let before = fixture.entries();
+        let mut writer = FileIndexWriter::new(&mut guard);
+        writer.upsert_file(indexed_file("new.txt", 9, 2));
+
+        writer
+            .save_with(&mut PublicationControl {
+                next_id: Some(100),
+                ..PublicationControl::default()
+            })
+            .unwrap();
+
+        assert_eq!(fs::read(&paths[0]).unwrap(), b"collision");
+        assert_eq!(fs::read(&paths[1]).unwrap(), ORIGINAL);
+        assert_eq!(fs::read(&paths[2]).unwrap(), b"unrelated contents");
+        assert!(paths[3].is_dir());
+        assert_eq!(fs::read(&unrelated).unwrap(), b"unrelated contents");
+        assert_eq!(fixture.entries(), before);
+        assert_eq!(
+            fs::read(&index_path).unwrap(),
+            b"aifs-index-v1\n9\t2\tnew.txt\n"
+        );
+    }
+
+    #[test]
+    fn exhausted_collision_retries_preserve_all_preexisting_files() {
+        let fixture = TestDir::new("collision-limit");
+        let index_path = fixture.path.join("index.txt");
+        fs::write(&index_path, ORIGINAL).unwrap();
+        let mut guard = IndexWriterGuard::acquire(&index_path).unwrap();
+        let paths = (0..TEMPORARY_CREATE_ATTEMPTS)
+            .map(|id| temporary_index_path(guard.index_path(), id as u64).unwrap())
+            .collect::<Vec<_>>();
+        for path in &paths {
+            fs::write(path, b"collision").unwrap();
+        }
+        let before = fixture.entries();
+        let writer = FileIndexWriter::new(&mut guard);
+        let mut control = PublicationControl {
+            next_id: Some(0),
+            ..PublicationControl::default()
+        };
+
+        let error = writer.save_with(&mut control).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(control.next_id, Some(TEMPORARY_CREATE_ATTEMPTS as u64));
+        assert_eq!(fs::read(&index_path).unwrap(), ORIGINAL);
+        assert_eq!(fixture.entries(), before);
+        for path in paths {
+            assert_eq!(fs::read(path).unwrap(), b"collision");
+        }
+    }
+
+    #[test]
+    fn writer_constructors_always_use_the_guards_stable_destination() {
+        let fixture = TestDir::new("stable-destination");
+        let requested = fixture.path.join("new-directory").join("index.txt");
+        let mut guard = IndexWriterGuard::acquire(&requested).unwrap();
+        let destination = guard.index_path().to_owned();
+        assert!(destination.is_absolute());
+        let writer = FileIndexWriter::new(&mut guard);
+        assert_eq!(writer.store.path, destination);
+        writer.save().unwrap();
+        drop(writer);
+        let reopened = FileIndexWriter::open(&mut guard).unwrap();
+        assert_eq!(reopened.store.path, destination);
+        assert_eq!(FileIndexStore::open(&requested).unwrap().file_count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exclusive_creation_skips_live_and_dangling_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = TestDir::new("symlink-collisions");
+        let index_path = fixture.path.join("index.txt");
+        fs::write(&index_path, ORIGINAL).unwrap();
+        let unrelated = fixture.path.join("unrelated.txt");
+        let missing = fixture.path.join("missing.txt");
+        fs::write(&unrelated, b"unrelated contents").unwrap();
+        let mut guard = IndexWriterGuard::acquire(&index_path).unwrap();
+        let live_link = temporary_index_path(guard.index_path(), 100).unwrap();
+        let dangling_link = temporary_index_path(guard.index_path(), 101).unwrap();
+        symlink(&unrelated, &live_link).unwrap();
+        symlink(&missing, &dangling_link).unwrap();
+        let before = fixture.entries();
+        let writer = FileIndexWriter::new(&mut guard);
+
+        writer
+            .save_with(&mut PublicationControl {
+                next_id: Some(100),
+                ..PublicationControl::default()
+            })
+            .unwrap();
+
+        assert_eq!(fs::read(&unrelated).unwrap(), b"unrelated contents");
+        assert_eq!(fs::read_link(live_link).unwrap(), unrelated);
+        assert_eq!(fs::read_link(dangling_link).unwrap(), missing);
+        assert!(!missing.exists());
+        assert_eq!(fixture.entries(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn newly_created_temp_and_published_snapshot_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = TestDir::new("private-permissions");
+        let index_path = fixture.path.join("index.txt");
+        let mut guard = IndexWriterGuard::acquire(&index_path).unwrap();
+        let (temporary, file) =
+            create_temporary_file(guard.index_path(), &mut PublicationControl::default()).unwrap();
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o177, 0);
+        drop(file);
+        drop(temporary);
+        let writer = FileIndexWriter::new(&mut guard);
+        writer.save().unwrap();
+        assert_eq!(
+            fs::metadata(index_path).unwrap().permissions().mode() & 0o177,
+            0
+        );
+    }
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "ai-file-search-publication-{name}-{}-{}",
+                std::process::id(),
+                NEXT_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).unwrap();
+            Self { path }
+        }
+
+        fn entries(&self) -> Vec<OsString> {
+            let mut entries = fs::read_dir(&self.path)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            entries.sort();
+            entries
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.path).unwrap();
+        }
+    }
+
+    fn indexed_file(path: &str, size_bytes: u64, modified_unix_seconds: u64) -> IndexedFile {
+        IndexedFile {
+            relative_path: PathId::from_user_path(path),
+            size_bytes,
+            modified_unix_seconds,
+        }
+    }
 }

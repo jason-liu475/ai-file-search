@@ -1,11 +1,11 @@
 use std::fmt::Write;
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use ai_file_search_indexer::{
-    FileIndexStore, IndexedFile, MemoryIndexStore, RefreshSummary, ScanOptions, Scanner,
+    FileIndexStore, FileIndexWriter, IndexWriterGuard, IndexedFile, MemoryIndexStore,
+    RefreshSummary, ScanOptions, Scanner,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -287,6 +287,16 @@ fn stats(index_path: &str, output_format: OutputFormat) -> CliResult {
 }
 
 fn index(root: &str, index_path: &str, options: ScanOptions) -> CliResult {
+    let mut guard = match IndexWriterGuard::acquire(Path::new(index_path)) {
+        Ok(guard) => guard,
+        Err(error) => {
+            return CliResult {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: format!("index lock failed: {error}\n"),
+            };
+        }
+    };
     let root = match fs::canonicalize(root) {
         Ok(root) => root,
         Err(error) => {
@@ -297,8 +307,7 @@ fn index(root: &str, index_path: &str, options: ScanOptions) -> CliResult {
             };
         }
     };
-    let index_path = Path::new(index_path);
-    let files = match scan_files_for_index(&root, index_path, options.clone()) {
+    let files = match Scanner::new(options.clone()).scan_for_index(&root, guard.index_path()) {
         Ok(files) => files,
         Err(error) => {
             return CliResult {
@@ -310,7 +319,7 @@ fn index(root: &str, index_path: &str, options: ScanOptions) -> CliResult {
     };
     let file_count = files.len();
 
-    let mut store = FileIndexStore::new(index_path);
+    let mut store = FileIndexWriter::new(&mut guard);
     store.set_root_path(&root);
     store.set_scan_policy(options);
     store.replace_all(files);
@@ -367,7 +376,7 @@ fn status(
             };
         }
     };
-    let files = match scan_files_for_index(&root, index_path, options) {
+    let files = match Scanner::new(options).scan_for_index(&root, index_path) {
         Ok(files) => files,
         Err(error) => {
             return CliResult {
@@ -395,8 +404,18 @@ fn status(
 
 fn refresh(root: &str, index_path: &str, requested_options: Option<ScanOptions>) -> CliResult {
     let root = Path::new(root);
-    let index_path = Path::new(index_path);
-    let mut store = match FileIndexStore::open(index_path) {
+    let mut guard = match IndexWriterGuard::acquire(Path::new(index_path)) {
+        Ok(guard) => guard,
+        Err(error) => {
+            return CliResult {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: format!("index lock failed: {error}\n"),
+            };
+        }
+    };
+    let index_path = guard.index_path().to_path_buf();
+    let mut store = match FileIndexWriter::open(&mut guard) {
         Ok(store) => store,
         Err(error) => {
             return CliResult {
@@ -426,7 +445,7 @@ fn refresh(root: &str, index_path: &str, requested_options: Option<ScanOptions>)
             };
         }
     };
-    let files = match scan_files_for_index(&root, index_path, options) {
+    let files = match Scanner::new(options).scan_for_index(&root, &index_path) {
         Ok(files) => files,
         Err(error) => {
             return CliResult {
@@ -485,38 +504,6 @@ fn format_json_summary(file_count: usize, summary: &RefreshSummary) -> String {
         "{{\"scanned_files\":{file_count},\"added\":{},\"updated\":{},\"removed\":{},\"unchanged\":{}}}\n",
         summary.added, summary.updated, summary.removed, summary.unchanged
     )
-}
-
-fn scan_files_for_index(
-    root: &Path,
-    index_path: &Path,
-    options: ScanOptions,
-) -> io::Result<Vec<IndexedFile>> {
-    let scanner = Scanner::new(options);
-    let mut files = scanner.scan(root)?;
-
-    if let Some(index_relative_path) = relative_index_path(root, index_path) {
-        files.retain(|file| file.relative_path.as_normalized() != index_relative_path);
-    }
-
-    Ok(files)
-}
-
-fn relative_index_path(root: &Path, index_path: &Path) -> Option<String> {
-    let root = fs::canonicalize(root).ok()?;
-    let index_path = fs::canonicalize(index_path).ok().or_else(|| {
-        let absolute_path = std::path::absolute(index_path).ok()?;
-        let parent = fs::canonicalize(absolute_path.parent()?).ok()?;
-        Some(parent.join(absolute_path.file_name()?))
-    })?;
-
-    index_path.strip_prefix(&root).ok().map(|relative_path| {
-        relative_path
-            .components()
-            .collect::<PathBuf>()
-            .to_string_lossy()
-            .replace('\\', "/")
-    })
 }
 
 fn usage_error() -> CliResult {

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use ai_file_search_core::PathId;
 use ai_file_search_daemon::{StreamStatus, handle_json_stream};
-use ai_file_search_indexer::{FileIndexStore, IndexedFile};
+use ai_file_search_indexer::{FileIndexWriter, IndexWriterGuard, IndexedFile};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 #[tokio::test]
@@ -138,7 +138,8 @@ impl Drop for TestDir {
 }
 
 fn save_index(index_path: &Path, files: Vec<IndexedFile>) {
-    let mut store = FileIndexStore::open(index_path).expect("store should open");
+    let mut guard = IndexWriterGuard::acquire(index_path).expect("writer should acquire");
+    let mut store = FileIndexWriter::new(&mut guard);
     store.replace_all(files);
     store.save().expect("store should save");
 }

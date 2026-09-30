@@ -6,6 +6,8 @@ use std::time::UNIX_EPOCH;
 
 use ai_file_search_core::PathId;
 
+use crate::writer_lock::{adjacent_lock_path, publication_prefix, resolve_index_path};
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ScanOptions {
     excluded_names: BTreeSet<String>,
@@ -54,8 +56,27 @@ impl Scanner {
     /// Returns an error when the root directory cannot be read or when a
     /// directory entry cannot be inspected.
     pub fn scan(&self, root: &Path) -> io::Result<Vec<IndexedFile>> {
+        self.scan_with_artifacts(root, None)
+    }
+
+    /// Scans while excluding this index, its lock and its publication namespace.
+    ///
+    /// # Errors
+    /// Returns an error when the root, index identity or an entry cannot be read.
+    pub fn scan_for_index(&self, root: &Path, index_path: &Path) -> io::Result<Vec<IndexedFile>> {
+        let root = fs::canonicalize(root)?;
+        let index = resolve_index_path(index_path, false)?;
+        self.scan_with_artifacts(&root, Some(&index))
+    }
+
+    fn scan_with_artifacts(
+        &self,
+        root: &Path,
+        index: Option<&Path>,
+    ) -> io::Result<Vec<IndexedFile>> {
         let mut files = Vec::new();
-        self.scan_directory(root, root, &mut files)?;
+        let artifacts = index.map(IndexArtifacts::new);
+        self.scan_directory(root, root, artifacts.as_ref(), &mut files)?;
 
         files.sort_by(|left, right| {
             left.relative_path
@@ -70,6 +91,7 @@ impl Scanner {
         &self,
         root: &Path,
         directory: &Path,
+        artifacts: Option<&IndexArtifacts>,
         files: &mut Vec<IndexedFile>,
     ) -> io::Result<()> {
         for entry in fs::read_dir(directory)? {
@@ -79,9 +101,12 @@ impl Scanner {
 
             if file_type.is_dir() {
                 if !self.options.excludes(&path) {
-                    self.scan_directory(root, &path, files)?;
+                    self.scan_directory(root, &path, artifacts, files)?;
                 }
             } else if file_type.is_file() {
+                if artifacts.is_some_and(|artifacts| artifacts.excludes(&path)) {
+                    continue;
+                }
                 let metadata = entry.metadata()?;
                 let relative_path = relative_path(root, &path);
                 files.push(IndexedFile {
@@ -93,6 +118,52 @@ impl Scanner {
         }
 
         Ok(())
+    }
+}
+
+struct IndexArtifacts {
+    index: PathBuf,
+    lock: PathBuf,
+    publication_prefix: std::ffi::OsString,
+}
+
+impl IndexArtifacts {
+    fn new(index: &Path) -> Self {
+        let lock = adjacent_lock_path(index);
+        let lock =
+            if fs::symlink_metadata(&lock).is_ok_and(|metadata| metadata.file_type().is_file()) {
+                fs::canonicalize(&lock).unwrap_or(lock)
+            } else {
+                lock
+            };
+        Self {
+            index: index.to_path_buf(),
+            lock,
+            publication_prefix: publication_prefix(index),
+        }
+    }
+
+    fn excludes(&self, path: &Path) -> bool {
+        if path == self.index || path == self.lock {
+            return true;
+        }
+        if path.parent() != self.index.parent() {
+            return false;
+        }
+        let Some(name) = path.file_name() else {
+            return false;
+        };
+        let name = name.as_encoded_bytes();
+        let prefix = self.publication_prefix.as_encoded_bytes();
+        #[cfg(windows)]
+        {
+            name.get(..prefix.len())
+                .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+        }
+        #[cfg(not(windows))]
+        {
+            name.starts_with(prefix)
+        }
     }
 }
 

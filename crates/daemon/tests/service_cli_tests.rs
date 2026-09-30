@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use ai_file_search_daemon::service::{SERVICE_STATE_ENV, ServiceState, read_state, write_state};
 use ai_file_search_daemon::{run_with_state_path, send_ipc_request};
-use ai_file_search_indexer::{FileIndexStore, ScanOptions};
+use ai_file_search_indexer::{FileIndexStore, FileIndexWriter, IndexWriterGuard, ScanOptions};
 
 #[test]
 fn service_status_json_reports_stopped_without_state_file() {
@@ -75,10 +75,11 @@ fn service_start_requires_index_root_metadata() {
     let fixture = TestDir::new("service_start_requires_index_root_metadata");
     let state_path = fixture.path().join("service-state.json");
     let index_path = fixture.path().join("index.txt");
-    FileIndexStore::open(&index_path)
-        .expect("store should open")
+    let mut guard = IndexWriterGuard::acquire(&index_path).expect("writer should acquire");
+    FileIndexWriter::new(&mut guard)
         .save()
         .expect("store should save without root metadata");
+    drop(guard);
 
     let result = run_with_state(
         &state_path,
@@ -230,10 +231,13 @@ async fn service_start_spawns_service_and_persists_auto_refresh_seconds() {
     let endpoint = service_start_endpoint(&fixture);
     fs::create_dir_all(&root).expect("root directory should be created");
 
-    let mut store = FileIndexStore::open(&index_path).expect("store should open");
+    let mut writer_guard = IndexWriterGuard::acquire(&index_path).expect("writer should acquire");
+    let mut store = FileIndexWriter::new(&mut writer_guard);
     store.set_root_path(&root);
     store.set_scan_policy(ScanOptions::default());
     store.save().expect("store should save with root metadata");
+    drop(store);
+    drop(writer_guard);
 
     let mut guard = ServiceStopGuard::new(&state_path);
     let start = Command::new(daemon_binary())
@@ -609,7 +613,8 @@ async fn service_scan_policy_hidden_no_auto_keeps_legacy_behavior() {
 }
 
 fn save_service_index(index_path: &Path, root: &Path, known_policy: bool) {
-    let mut store = FileIndexStore::open(index_path).unwrap();
+    let mut guard = IndexWriterGuard::acquire(index_path).unwrap();
+    let mut store = FileIndexWriter::new(&mut guard);
     store.set_root_path(root);
     if known_policy {
         store.set_scan_policy(ScanOptions::default());

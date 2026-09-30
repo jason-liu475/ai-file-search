@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ai_file_search_indexer::{FileIndexStore, IndexedFile, RefreshSummary, ScanOptions, Scanner};
+use ai_file_search_indexer::{
+    FileIndexStore, FileIndexWriter, IndexWriterGuard, RefreshSummary, ScanOptions, Scanner,
+};
 use ai_file_search_protocol::{Request, Response};
 use serde_json::json;
 use service::{
@@ -244,21 +246,27 @@ async fn service_start(args: &[String], state_path: &Path) -> CliResult {
         Ok(parsed) => parsed,
         Err(result) => return result,
     };
+    if let Some(state) = running_state(state_path).await {
+        return service_running_result(&state);
+    }
     let index_path = match resolve_index_path(parsed.index_path) {
         Ok(path) => path,
         Err(result) => return result,
     };
-    if let Err(result) =
-        validate_index_root_metadata(&index_path, parsed.auto_refresh_seconds.is_some())
-    {
-        return result;
-    }
+    let index_path = {
+        let guard = match acquire_service_writer(&index_path) {
+            Ok(guard) => guard,
+            Err(result) => return result,
+        };
+        if let Err(result) =
+            validate_index_root_metadata(guard.index_path(), parsed.auto_refresh_seconds.is_some())
+        {
+            return result;
+        }
+        guard.index_path().to_path_buf()
+    };
 
-    if let Some(state) = running_state(state_path).await {
-        return service_running_result(&state);
-    }
-
-    let child =
+    let mut child =
         match spawn_service_child(&index_path, &parsed.endpoint, parsed.auto_refresh_seconds) {
             Ok(child) => child,
             Err(result) => return result,
@@ -269,9 +277,17 @@ async fn service_start(args: &[String], state_path: &Path) -> CliResult {
         &index_path,
         parsed.auto_refresh_seconds,
         state_path,
-        child.id(),
+        &mut child,
     )
     .await
+}
+
+fn acquire_service_writer(index_path: &Path) -> Result<IndexWriterGuard, CliResult> {
+    IndexWriterGuard::acquire(index_path).map_err(|error| CliResult {
+        exit_code: 1,
+        stdout: String::new(),
+        stderr: format!("index writer acquire failed: {error}\n"),
+    })
 }
 
 struct ServiceStartArgs<'a> {
@@ -436,20 +452,37 @@ async fn wait_for_started_service(
     index_path: &Path,
     auto_refresh_seconds: Option<u64>,
     state_path: &Path,
-    pid: u32,
+    child: &mut Child,
 ) -> CliResult {
     for _ in 0..40 {
+        match child.try_wait() {
+            Ok(None) => {}
+            Ok(Some(status)) => {
+                return CliResult {
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: format!("service exited before becoming healthy: {status}\n"),
+                };
+            }
+            Err(error) => {
+                reap_service_child(child);
+                return CliResult {
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: format!("service child status failed: {error}\n"),
+                };
+            }
+        }
         if ping_endpoint(endpoint).await {
             let state = ServiceState {
                 endpoint: endpoint.to_owned(),
-                pid,
+                pid: child.id(),
                 index_path: index_path.to_path_buf(),
                 started_unix_seconds: now_unix_seconds(),
                 auto_refresh_seconds,
             };
             if let Err(error) = write_state(state_path, &state) {
-                let _ =
-                    send_ipc_request(endpoint, r#"{"id":1,"method":"shutdown","params":{}}"#).await;
+                reap_service_child(child);
                 return CliResult {
                     exit_code: 1,
                     stdout: String::new(),
@@ -470,10 +503,18 @@ async fn wait_for_started_service(
         sleep(Duration::from_millis(50)).await;
     }
 
+    reap_service_child(child);
     CliResult {
         exit_code: 1,
         stdout: String::new(),
         stderr: "service did not become healthy\n".to_owned(),
+    }
+}
+
+fn reap_service_child(child: &mut Child) {
+    if !matches!(child.try_wait(), Ok(Some(_))) {
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
@@ -489,13 +530,20 @@ pub async fn service_run(
     endpoint: &str,
     auto_refresh_seconds: Option<u64>,
 ) -> i32 {
+    let mut guard = match acquire_service_writer(index_path) {
+        Ok(guard) => guard,
+        Err(result) => {
+            eprint!("{}", result.stderr);
+            return result.exit_code;
+        }
+    };
     if auto_refresh_seconds.is_some()
-        && let Err(result) = validate_index_root_metadata(index_path, true)
+        && let Err(result) = validate_index_root_metadata(guard.index_path(), true)
     {
         eprint!("{}", result.stderr);
         return result.exit_code;
     }
-    match serve_ipc(index_path, endpoint).await {
+    match serve_ipc_with_guard(&mut guard, endpoint).await {
         Ok(()) => 0,
         Err(error) => {
             eprintln!("service run failed: {error}");
@@ -518,6 +566,14 @@ pub fn handle_json_line(index_path: &Path, line: &str) -> Response {
 
 #[must_use]
 pub fn handle_json_request(index_path: &Path, line: &str) -> HandlerOutcome {
+    handle_json_request_with_guard(index_path, line, None)
+}
+
+fn handle_json_request_with_guard(
+    index_path: &Path,
+    line: &str,
+    guard: Option<&mut IndexWriterGuard>,
+) -> HandlerOutcome {
     let request = match Request::from_json_line(line) {
         Ok(request) => request,
         Err(error) => {
@@ -550,7 +606,7 @@ pub fn handle_json_request(index_path: &Path, line: &str) -> HandlerOutcome {
             shutdown_requested: false,
         },
         "refresh" | "reindex" => HandlerOutcome {
-            response: refresh(index_path, &request),
+            response: refresh(index_path, &request, guard),
             shutdown_requested: false,
         },
         "search" => HandlerOutcome {
@@ -646,7 +702,7 @@ fn index_status(index_path: &Path, request: &Request) -> Response {
         Err(message) => return Response::error(request.id, message),
     };
 
-    let files = match scan_files_for_index(&root, index_path, options) {
+    let files = match Scanner::new(options).scan_for_index(&root, index_path) {
         Ok(files) => files,
         Err(error) => return Response::error(request.id, format!("scan failed: {error}")),
     };
@@ -667,13 +723,29 @@ fn index_status(index_path: &Path, request: &Request) -> Response {
     )
 }
 
-fn refresh(index_path: &Path, request: &Request) -> Response {
+fn refresh(index_path: &Path, request: &Request, guard: Option<&mut IndexWriterGuard>) -> Response {
     let options = match scan_options(&request.params) {
         Ok(options) => options,
         Err(message) => return Response::error(request.id, message),
     };
 
-    let mut store = match FileIndexStore::open(index_path) {
+    let mut standalone_guard;
+    let guard = if let Some(guard) = guard {
+        guard
+    } else {
+        standalone_guard = match IndexWriterGuard::acquire(index_path) {
+            Ok(guard) => guard,
+            Err(error) => {
+                return Response::error(
+                    request.id,
+                    format!("index writer acquire failed: {error}"),
+                );
+            }
+        };
+        &mut standalone_guard
+    };
+    let index_path = guard.index_path().to_path_buf();
+    let mut store = match FileIndexWriter::open(guard) {
         Ok(store) => store,
         Err(error) => return Response::error(request.id, format!("index open failed: {error}")),
     };
@@ -687,7 +759,7 @@ fn refresh(index_path: &Path, request: &Request) -> Response {
         Err(message) => return Response::error(request.id, message),
     };
 
-    let files = match scan_files_for_index(&root, index_path, options) {
+    let files = match Scanner::new(options).scan_for_index(&root, &index_path) {
         Ok(files) => files,
         Err(error) => return Response::error(request.id, format!("scan failed: {error}")),
     };
@@ -758,39 +830,6 @@ fn scan_options(params: &serde_json::Value) -> Result<Option<ScanOptions>, &'sta
         .map(Some)
 }
 
-fn scan_files_for_index(
-    root: &Path,
-    index_path: &Path,
-    options: ScanOptions,
-) -> io::Result<Vec<IndexedFile>> {
-    let scanner = Scanner::new(options);
-    let mut files = scanner.scan(root)?;
-
-    if let Some(index_relative_path) = relative_index_path(root, index_path) {
-        files.retain(|file| file.relative_path.as_normalized() != index_relative_path);
-    }
-
-    Ok(files)
-}
-
-fn relative_index_path(root: &Path, index_path: &Path) -> Option<String> {
-    let relative_path = match (
-        std::fs::canonicalize(root),
-        std::fs::canonicalize(index_path),
-    ) {
-        (Ok(root), Ok(index_path)) => index_path.strip_prefix(root).ok()?.to_path_buf(),
-        _ => index_path.strip_prefix(root).ok()?.to_path_buf(),
-    };
-
-    Some(
-        relative_path
-            .components()
-            .collect::<PathBuf>()
-            .to_string_lossy()
-            .replace('\\', "/"),
-    )
-}
-
 fn stats(index_path: &Path, id: u64) -> Response {
     let store = match FileIndexStore::open(index_path) {
         Ok(store) => store,
@@ -846,6 +885,17 @@ pub async fn handle_json_stream<S>(index_path: &Path, stream: S) -> io::Result<S
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    handle_json_stream_with_guard(index_path, stream, None).await
+}
+
+async fn handle_json_stream_with_guard<S>(
+    index_path: &Path,
+    stream: S,
+    mut guard: Option<&mut IndexWriterGuard>,
+) -> io::Result<StreamStatus>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut stream = BufReader::new(stream);
     let mut line = String::new();
 
@@ -856,7 +906,7 @@ where
             return Ok(StreamStatus::ClientDisconnected);
         }
 
-        let outcome = handle_json_request(index_path, &line);
+        let outcome = handle_json_request_with_guard(index_path, &line, guard.as_deref_mut());
         stream
             .get_mut()
             .write_all(outcome.response.to_json_line().as_bytes())
@@ -869,7 +919,12 @@ where
     }
 }
 
-async fn handle_one_json_request<S>(index_path: &Path, stream: S) -> io::Result<StreamStatus>
+#[cfg(windows)]
+async fn handle_one_json_request<S>(
+    index_path: &Path,
+    stream: S,
+    guard: &mut IndexWriterGuard,
+) -> io::Result<StreamStatus>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -879,7 +934,7 @@ where
         return Ok(StreamStatus::ClientDisconnected);
     }
 
-    let outcome = handle_json_request(index_path, &line);
+    let outcome = handle_json_request_with_guard(index_path, &line, Some(guard));
     stream
         .get_mut()
         .write_all(outcome.response.to_json_line().as_bytes())
@@ -931,17 +986,23 @@ fn pipe_name(endpoint: &str) -> String {
 ///
 /// # Errors
 ///
-/// Returns an I/O error when the endpoint cannot be created or a client stream
-/// cannot be handled.
-#[cfg(windows)]
+/// Returns an I/O error when the index is already owned, the endpoint cannot be
+/// created, or a client stream cannot be handled.
 pub async fn serve_ipc(index_path: &Path, endpoint: &str) -> io::Result<()> {
+    let mut guard = IndexWriterGuard::acquire(index_path)?;
+    serve_ipc_with_guard(&mut guard, endpoint).await
+}
+
+#[cfg(windows)]
+async fn serve_ipc_with_guard(guard: &mut IndexWriterGuard, endpoint: &str) -> io::Result<()> {
     use tokio::net::windows::named_pipe::ServerOptions;
 
+    let index_path = guard.index_path().to_path_buf();
     let endpoint = pipe_name(endpoint);
     loop {
         let server = ServerOptions::new().create(&endpoint)?;
         server.connect().await?;
-        let status = handle_one_json_request(index_path, server).await?;
+        let status = handle_one_json_request(&index_path, server, guard).await?;
         if status == StreamStatus::ShutdownRequested {
             return Ok(());
         }
@@ -961,21 +1022,16 @@ pub async fn send_ipc_request(endpoint: &str, request: &str) -> io::Result<Strin
     send_json_request(client, request).await
 }
 
-/// Serves JSON-RPC requests over the platform IPC transport.
-///
-/// # Errors
-///
-/// Returns an I/O error when the endpoint cannot be created or a client stream
-/// cannot be handled.
 #[cfg(unix)]
-pub async fn serve_ipc(index_path: &Path, endpoint: &str) -> io::Result<()> {
+async fn serve_ipc_with_guard(guard: &mut IndexWriterGuard, endpoint: &str) -> io::Result<()> {
     use tokio::net::UnixListener;
 
+    let index_path = guard.index_path().to_path_buf();
     let _ = std::fs::remove_file(endpoint);
     let listener = UnixListener::bind(endpoint)?;
     loop {
         let (stream, _) = listener.accept().await?;
-        let status = handle_json_stream(index_path, stream).await?;
+        let status = handle_json_stream_with_guard(&index_path, stream, Some(guard)).await?;
         if status == StreamStatus::ShutdownRequested {
             return Ok(());
         }
@@ -993,4 +1049,148 @@ pub async fn send_ipc_request(endpoint: &str, request: &str) -> io::Result<Strin
 
     let stream = UnixStream::connect(endpoint).await?;
     send_json_request(stream, request).await
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    use std::fs;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore = "startup subprocess helper"]
+    fn startup_child_without_endpoint() {
+        let index = PathBuf::from(std::env::var_os("AIFS_TEST_STARTUP_INDEX").unwrap());
+        let _guard = IndexWriterGuard::acquire(&index).unwrap();
+        if let Some(ready) = std::env::var_os("AIFS_TEST_STARTUP_READY") {
+            fs::write(PathBuf::from(ready), b"ready").unwrap();
+            std::thread::sleep(Duration::from_mins(1));
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_timeout_kills_and_reaps_only_owned_child() {
+        let fixture = StartupFixture::new("timeout");
+        let ready = fixture.path.join("ready");
+        let mut child = fixture.child(Some(&ready));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !ready.exists() {
+            assert!(Instant::now() < deadline);
+            assert!(child.0.try_wait().unwrap().is_none());
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert!(IndexWriterGuard::acquire(&fixture.index).is_err());
+        let result = wait_for_started_service(
+            &fixture.endpoint(),
+            &fixture.index,
+            None,
+            &fixture.path.join("state.json"),
+            &mut child.0,
+        )
+        .await;
+        assert_eq!(result.exit_code, 1);
+        assert_eq!(result.stderr, "service did not become healthy\n");
+        assert!(
+            child.0.try_wait().unwrap().is_some(),
+            "owned startup child must be reaped"
+        );
+        assert!(IndexWriterGuard::acquire(&fixture.index).is_ok());
+    }
+
+    #[tokio::test]
+    async fn startup_child_lock_race_exits_quickly_and_is_reaped() {
+        let fixture = StartupFixture::new("lock-race");
+        let owner = IndexWriterGuard::acquire(&fixture.index).unwrap();
+        let mut child = fixture.child(None);
+        let started = Instant::now();
+        let result = wait_for_started_service(
+            &fixture.endpoint(),
+            &fixture.index,
+            None,
+            &fixture.path.join("state.json"),
+            &mut child.0,
+        )
+        .await;
+        assert_eq!(result.exit_code, 1);
+        assert!(
+            result
+                .stderr
+                .starts_with("service exited before becoming healthy:")
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(child.0.try_wait().unwrap().is_some());
+        assert!(!fixture.path.join("state.json").exists());
+        assert!(IndexWriterGuard::acquire(&fixture.index).is_err());
+        drop(owner);
+        assert!(IndexWriterGuard::acquire(&fixture.index).is_ok());
+    }
+
+    struct TestChild(Child);
+
+    impl Drop for TestChild {
+        fn drop(&mut self) {
+            reap_service_child(&mut self.0);
+        }
+    }
+
+    struct StartupFixture {
+        path: PathBuf,
+        index: PathBuf,
+    }
+
+    impl StartupFixture {
+        fn new(name: &str) -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "aifs-startup-{name}-{}-{nonce}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            let index = path.join("index.txt");
+            Self { path, index }
+        }
+        fn child(&self, ready: Option<&Path>) -> TestChild {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "startup_tests::startup_child_without_endpoint",
+                    "--ignored",
+                ])
+                .env("AIFS_TEST_STARTUP_INDEX", &self.index)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if let Some(ready) = ready {
+                command.env("AIFS_TEST_STARTUP_READY", ready);
+            }
+            TestChild(command.spawn().unwrap())
+        }
+        fn endpoint(&self) -> String {
+            #[cfg(windows)]
+            {
+                self.path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            }
+            #[cfg(unix)]
+            {
+                self.path
+                    .join("missing.sock")
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        }
+    }
+
+    impl Drop for StartupFixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.path).unwrap();
+        }
+    }
 }

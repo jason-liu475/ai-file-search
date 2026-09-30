@@ -6,13 +6,13 @@ Reviewed: 2026-09-30. Implement in the existing main checkout. This revision rep
 
 - [x] Task 1: interval configuration only, committed as fd2f6a9.
 - [x] Task 2: persist and enforce scan scope.
-- [ ] Task 3: single-writer ownership and safe snapshot publication.
+- [x] Task 3: single-writer ownership and safe snapshot publication (Windows verification; native Linux/macOS gates remain open).
 - [ ] Task 4: shared scan/compare and controlled allocations.
 - [ ] Task 5: bounded managed IPC and safe lifecycle.
 - [ ] Task 6: fixed-delay scheduler and last-attempt status.
 - [ ] Task 7: platform, performance, and documentation acceptance.
 
-The current `service_run` uses `auto_refresh_seconds` only to validate root/policy prerequisites, not to schedule scans. Tasks 1-2 are implemented; Tasks 3-7 remain planned. Do not enable or advertise automatic refresh before their safety gates pass.
+The current `service_run` uses `auto_refresh_seconds` only to validate root/policy prerequisites, not to schedule scans. Tasks 1-3 are implemented; Tasks 4-7 remain planned. The Task 3 native Linux/macOS acceptance item below remains unverified and is required before claiming cross-platform completion. Do not enable or advertise automatic refresh before their safety gates pass.
 
 **Stack:** Rust edition 2024, MSRV 1.96, existing Tokio IPC/time support, serde/serde_json, and repository temporary-directory test helpers. There is no existing `tempfile` dependency; reuse local helpers rather than adding one implicitly.
 
@@ -53,22 +53,26 @@ Files: `crates/indexer/src/store.rs` and store tests; `crates/cli/src/lib.rs` an
 
 No timer is connected in this task. Startup policy/root checks now run for configured auto refresh in both parent and hidden child; no-auto legacy lifecycle behavior is preserved. Native Linux/macOS and performance gates remain unverified.
 
-Shared indexer APIs: `FileIndexStore::new` creates an empty rebuild destination without reading old contents; `scan_policy`/`set_scan_policy` distinguish unknown and known-empty scope; `resolve_scan_options(Option<ScanOptions>)` enforces inheritance/matching; `ScanOptions::excluded_names` exposes sorted, deduplicated names. No dependency was added.
+Shared indexer APIs: `FileIndexStore::new/open` now create read-only snapshots; Task 3 moved mutation/rebuild to guarded `FileIndexWriter::new/open`. `scan_policy`/`set_scan_policy` distinguish unknown and known-empty scope; `resolve_scan_options(Option<ScanOptions>)` enforces inheritance/matching; `ScanOptions::excluded_names` exposes sorted, deduplicated names. No dependency was added.
 
 ## Task 3: Single Writer And Safe Publication
 
-Files: `crates/indexer/src/store.rs`, an indexer-local writer guard helper if needed, indexer subprocess/storage tests, and all CLI/daemon write call sites.
+Files: `crates/indexer/src/store.rs`, `writer_lock.rs`, `scanner.rs`, storage/lock tests, and all CLI/daemon write call sites and subprocess tests.
 
-- [ ] Add real subprocess lock-contention tests for CLI/CLI, managed-service/CLI, daemon manual write/service, and second-service ownership of the same canonical index. Include release after normal exit and forced test-child termination.
-- [ ] Implement an indexer-owned RAII guard using a stable adjacent lock file and `std::fs::File::try_lock`. Hold it over old-index open, scan, comparison, and publication; a managed child holds it for its lifetime.
-- [ ] Make mutation/publication require the guard. Preserve existing read-only APIs; update every supported write entry point and its tests. Do not add a lock only to `service start` or acquire it only at `save()`.
-- [ ] Resolve relative/absolute and supported filesystem aliases to one lock identity. State limitations for hard-link aliases, mixed old writers, untrusted directories, and network filesystems. Never unlink the lock file on release or truncate an existing lock path.
-- [ ] Add injected failure tests for temporary creation, write, flush, sync, and replacement. Assert old index bytes remain unchanged for every pre-publication failure.
-- [ ] Test pre-existing temp-name collisions and links without requiring Windows symlink privileges: hard-link/collision tests run natively; conditional symlink coverage runs where permitted. Unrelated files must remain untouched.
-- [ ] Replace fixed `<index>.tmp` reuse with unique same-directory exclusive creation. Retry collisions; remove only files created by the current attempt. No unlink-old-index fallback.
-- [ ] Stream borrowed records through `BufWriter`, explicitly flush/sync, apply private permissions, close temporary handles as required, and atomically publish on supported local filesystems. Keep post-publication errors distinct from rollback.
+- [x] Add real subprocess contention tests for external guard owner/CLI, daemon manual write/service, and second-service ownership of the same canonical index. Include release after normal exit and forced test-child termination. An additional Windows smoke uses the actual CLI and service-run binaries together.
+- [x] Implement an indexer-owned RAII guard using a stable adjacent lock file and `std::fs::File::try_lock`. Hold it over old-index open, scan, comparison, and publication; managed and manual IPC children hold it for their lifetime.
+- [x] Make mutation/publication require a mutable guard borrow through `FileIndexWriter`. Preserve existing read-only APIs; update every supported write entry point and its tests. Three compile-fail doctests enforce reader/write-capability separation.
+- [x] Resolve relative/absolute and supported filesystem aliases to one lock identity. State limitations for hard-link aliases, mixed old writers, untrusted directories, and network filesystems. Never unlink the lock file on release or truncate an existing lock path. Windows case/parent aliases are tested; Unix symlink cases are conditional and unrun here.
+- [x] Add injected failure tests for temporary creation, write, flush, sync, and replacement. Assert old index bytes remain unchanged for every pre-publication failure.
+- [x] Test pre-existing temp-name collisions and links without requiring Windows symlink privileges: hard-link/file/directory collision tests pass natively; conditional symlink coverage is added but unrun here. Unrelated files remain untouched.
+- [x] Replace fixed `<index>.tmp` reuse with unique same-directory exclusive creation and 32 bounded collision retries. Remove only files created by the current attempt. No unlink-old-index fallback.
+- [x] Stream borrowed records through `BufWriter`, explicitly flush/sync, request Unix mode `0600` (Windows inherits trusted-directory ACL), close temporary handles before rename/cleanup, and replace on supported local filesystems. No fallible step follows successful replacement, and no power-loss durability guarantee is made.
 - [ ] Verify new and existing index publication on native Windows, Linux, and macOS, including read-only concurrent clients and rename/share-mode failure.
-- [ ] Run focused storage/subprocess tests and workspace tests; commit/push `fix: isolate index writers and publish snapshots safely`.
+- [x] Run focused storage/subprocess tests and one workspace suite: 162 Windows tests pass (39 added, including 3 compile-fail doctests). Three helper cases are ignored by the top-level runner and invoked as owned test children. Workspace fmt, Clippy and diff checks pass. Deliver as `fix: isolate index writers and publish snapshots safely`.
+
+Implemented with three disjoint code workers (storage, CLI, daemon), plus main-thread shared APIs, review and integration. The Windows smoke confirms service-held ownership rejects real CLI index/refresh, query/stats/status remain readable, service RPC refresh publishes added files, and normal child exit permits CLI refresh. Process audit found no remaining test/service child. Startup readiness failure and state-write failure now reap only the newly spawned `Child`; endpoint/state identity, unbounded health I/O and readiness provenance remain Task 5 gaps.
+
+Shared API: `IndexWriterGuard::acquire(&Path)`, `index_path()`, `lock_path()`, `FileIndexWriter::new/open(&mut guard)`, and `Scanner::scan_for_index(root, index_path)`. Guard/writer are not cloneable; only immutable snapshots may be cloned. Index, adjacent lock and reserved publication prefix are centrally excluded; ordinary `.tmp` and similarly named files elsewhere remain visible.
 
 Keep directory and endpoint access control distinct from cooperative locks. A lock is not protection against arbitrary same-user code or external processes ignoring the contract.
 

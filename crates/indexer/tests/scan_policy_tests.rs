@@ -3,7 +3,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use ai_file_search_indexer::{FileIndexStore, ScanOptions};
+use ai_file_search_indexer::{FileIndexStore, FileIndexWriter, IndexWriterGuard, ScanOptions};
 
 #[test]
 fn scan_policy_round_trips_escaped_names_in_sorted_order() {
@@ -14,7 +14,8 @@ fn scan_policy_round_trips_escaped_names_in_sorted_order() {
         .exclude_name("back\\slash")
         .exclude_name(".git")
         .exclude_name(".git");
-    let mut store = FileIndexStore::new(&index_path);
+    let mut guard = IndexWriterGuard::acquire(&index_path).unwrap();
+    let mut store = FileIndexWriter::new(&mut guard);
     store.set_root_path("root\\with\ttabs\n");
     store.set_scan_policy(options.clone());
     store.save().unwrap();
@@ -36,6 +37,7 @@ fn scan_policy_round_trips_escaped_names_in_sorted_order() {
 fn legacy_unknown_policy_is_distinct_from_explicitly_empty() {
     let fixture = TestDir::new("legacy-policy");
     let index_path = fixture.path().join("index.txt");
+    let mut guard = IndexWriterGuard::acquire(&index_path).unwrap();
     for contents in ["readme.txt\n", "aifs-index-v1\n7\t1\treadme.txt\n"] {
         fs::write(&index_path, contents).unwrap();
         let store = FileIndexStore::open(&index_path).unwrap();
@@ -44,7 +46,7 @@ fn legacy_unknown_policy_is_distinct_from_explicitly_empty() {
             store.resolve_scan_options(None).unwrap(),
             ScanOptions::default()
         );
-        store.save().unwrap();
+        FileIndexWriter::open(&mut guard).unwrap().save().unwrap();
         assert!(
             FileIndexStore::open(&index_path)
                 .unwrap()
@@ -53,7 +55,7 @@ fn legacy_unknown_policy_is_distinct_from_explicitly_empty() {
         );
     }
 
-    let mut store = FileIndexStore::new(&index_path);
+    let mut store = FileIndexWriter::new(&mut guard);
     store.set_scan_policy(ScanOptions::default());
     store.save().unwrap();
     assert_eq!(
@@ -69,7 +71,8 @@ fn known_policy_is_inherited_and_explicit_matching_sets_are_accepted() {
     let options = ScanOptions::default()
         .exclude_name(".git")
         .exclude_name("private");
-    let mut store = FileIndexStore::new(&index_path);
+    let mut guard = IndexWriterGuard::acquire(&index_path).unwrap();
+    let mut store = FileIndexWriter::new(&mut guard);
     store.set_scan_policy(options.clone());
     assert_eq!(store.resolve_scan_options(None).unwrap(), options);
     assert_eq!(
@@ -109,7 +112,8 @@ fn legacy_explicit_scope_does_not_confirm_policy() {
 #[test]
 fn known_empty_policy_rejects_new_exclusions() {
     let fixture = TestDir::new("resolve-empty");
-    let mut store = FileIndexStore::new(&fixture.path().join("index.txt"));
+    let mut guard = IndexWriterGuard::acquire(&fixture.path().join("index.txt")).unwrap();
+    let mut store = FileIndexWriter::new(&mut guard);
     store.set_scan_policy(ScanOptions::default());
     assert_eq!(
         store.resolve_scan_options(None).unwrap(),
@@ -165,7 +169,8 @@ fn stored_scan_policy_survives_open_and_save() {
 
     let store = FileIndexStore::open(&index_path).unwrap();
     assert_eq!(store.file_count(), 1);
-    store.save().unwrap();
+    let mut guard = IndexWriterGuard::acquire(&index_path).unwrap();
+    FileIndexWriter::open(&mut guard).unwrap().save().unwrap();
 
     let contents = fs::read_to_string(&index_path).unwrap();
     assert_eq!(
@@ -181,7 +186,8 @@ fn explicitly_empty_scan_policy_survives_save() {
     let contents = "aifs-index-v1\nmeta\tscan_policy\t1\n";
     fs::write(&index_path, contents).unwrap();
 
-    FileIndexStore::open(&index_path).unwrap().save().unwrap();
+    let mut guard = IndexWriterGuard::acquire(&index_path).unwrap();
+    FileIndexWriter::open(&mut guard).unwrap().save().unwrap();
 
     assert_eq!(fs::read_to_string(&index_path).unwrap(), contents);
 }

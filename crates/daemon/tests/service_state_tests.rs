@@ -693,14 +693,25 @@ struct TestDir {
 
 impl TestDir {
     fn new(name: &str) -> Self {
-        let mut path = std::env::temp_dir();
-        path.push(format!(
+        let sequence = TEST_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        #[cfg(windows)]
+        let path = std::env::temp_dir().join(format!(
             "ai-file-search-service-state-{name}-{}-{}",
             std::process::id(),
-            TEST_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            sequence
         ));
+        #[cfg(unix)]
+        let path = PathBuf::from("/tmp").join(format!("aifs-st-{}-{sequence}", std::process::id()));
 
-        fs::create_dir(&path).expect("unique fixture directory should be created");
+        fs::create_dir(&path)
+            .unwrap_or_else(|error| panic!("fixture {name} creation failed: {error}"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        #[cfg(unix)]
+        let path = fs::canonicalize(path).unwrap();
 
         Self { path }
     }

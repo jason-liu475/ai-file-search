@@ -1420,8 +1420,8 @@ where
     let mut stream = BufReader::new(stream);
     let mut response = String::new();
     stream.read_line(&mut response).await?;
-    stream.get_mut().shutdown().await?;
 
+    // Dropping the owned stream closes it without invalidating a received reply.
     Ok(response)
 }
 

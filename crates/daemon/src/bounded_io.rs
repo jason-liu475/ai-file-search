@@ -572,6 +572,7 @@ mod tests {
         StalledFlush,
         StalledShutdown,
         FailedShutdown,
+        DisconnectedShutdown,
     }
 
     struct ControlledStream {
@@ -610,6 +611,10 @@ mod tests {
                 WriterBehavior::FailedShutdown => Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "shutdown failed",
+                ))),
+                WriterBehavior::DisconnectedShutdown => Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "peer already closed",
                 ))),
                 WriterBehavior::StalledFlush => Pin::new(&mut self.inner).poll_shutdown(cx),
             }
@@ -661,6 +666,7 @@ mod tests {
         for behavior in [
             WriterBehavior::StalledShutdown,
             WriterBehavior::FailedShutdown,
+            WriterBehavior::DisconnectedShutdown,
         ] {
             let (inner, mut server) = duplex(16);
             let client = ControlledStream { inner, behavior };
@@ -674,6 +680,33 @@ mod tests {
                     send_request_with_timeout(client, "ping", SHORT_TIMEOUT),
                     reply
                 )
+            })
+            .await
+            .unwrap();
+            assert_eq!(result.unwrap(), "ok\n");
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_client_preserves_response_and_closes_without_half_shutdown() {
+        for behavior in [
+            WriterBehavior::StalledShutdown,
+            WriterBehavior::FailedShutdown,
+            WriterBehavior::DisconnectedShutdown,
+        ] {
+            let (inner, mut server) = duplex(16);
+            let client = ControlledStream { inner, behavior };
+            let reply = async {
+                let mut request = [0; 5];
+                server.read_exact(&mut request).await.unwrap();
+                assert_eq!(&request, b"ping\n");
+                server.write_all(b"ok\n").await.unwrap();
+                let mut remaining = Vec::new();
+                server.read_to_end(&mut remaining).await.unwrap();
+                assert!(remaining.is_empty());
+            };
+            let (result, ()) = timeout(TEST_TIMEOUT, async {
+                tokio::join!(crate::send_json_request(client, "ping"), reply)
             })
             .await
             .unwrap();

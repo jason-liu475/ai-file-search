@@ -1,446 +1,162 @@
 # Service Auto Refresh Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+Reviewed: 2026-09-30. Implement in the existing main checkout. This revision replaces the original Task 2/3 sequence because unattended writes require scope, storage, and connection safeguards first.
 
-**Goal:** Let the daemon service optionally refresh its persistent index on a bounded, low-memory interval without restarting, while keeping automatic work serialized with JSON-RPC requests.
+## Status And Rules
 
-**Architecture:** Parse and persist one optional refresh interval at service startup. Refactor scanning and index comparison into a shared internal operation that can either always save (manual `refresh`) or save only on change (scheduled refresh). The existing platform IPC loops own a Tokio interval and `select!` between one IPC accept/connect operation and an automatic refresh tick, so one process and one index mutation path remain authoritative.
+- [x] Task 1: interval configuration only, committed as fd2f6a9.
+- [ ] Task 2: persist and enforce scan scope.
+- [ ] Task 3: single-writer ownership and safe snapshot publication.
+- [ ] Task 4: shared scan/compare and controlled allocations.
+- [ ] Task 5: bounded managed IPC and safe lifecycle.
+- [ ] Task 6: fixed-delay scheduler and last-attempt status.
+- [ ] Task 7: platform, performance, and documentation acceptance.
 
-**Tech Stack:** Rust 2021 workspace, Tokio named-pipe/Unix-socket IPC, serde JSON state, `tempfile` fixtures, cargo test/clippy/fmt.
+The current `service_run` ignores `auto_refresh_seconds`. Tasks 2-7 are planned, not completed; do not enable or advertise automatic refresh before their safety gates pass.
 
----
+**Stack:** Rust edition 2024, MSRV 1.96, existing Tokio IPC/time support, serde/serde_json, and repository temporary-directory test helpers. There is no existing `tempfile` dependency; reuse local helpers rather than adding one implicitly.
 
-## Preconditions
+**Reference:** [Reviewed design](../specs/2026-07-10-service-auto-refresh-design.md).
 
-- Work directly on `main`; do not create a development branch or worktree.
-- Keep the default service behavior unchanged: automatic refresh is disabled unless explicitly configured.
-- Keep the option range inclusive: `30..=86_400` seconds.
-- Preserve the established CLI convention: usage errors print to stderr and return exit code `2`.
-- Do not add a watcher, polling worker process, background thread, telemetry stream, or a new public JSON-RPC method in this change.
+Work on `main` without a new branch/worktree. For each slice, add focused failing tests, implement, run focused tests, then run one workspace suite before committing. Inspect the complete diff and stage only intended files. Push each verified commit with ordinary `git push origin main`. Do not force-push or include unrelated user changes.
 
-## Task 1: Parse and Persist the Refresh Configuration
+Do not require a skill through this document. Follow the current user's skill permissions. Do not add duplicate plans for these follow-up slices.
 
-**Files:**
-- Modify: `crates/daemon/src/lib.rs`
-- Modify: `crates/daemon/src/main.rs`
-- Modify: `crates/daemon/src/service.rs`
-- Modify: `crates/daemon/tests/service_cli_tests.rs`
-- Modify: `crates/daemon/tests/service_state_tests.rs`
+## Task 1: Configuration Slice Already Implemented
 
-- [ ] **Step 1: Write failing state round-trip and legacy-compatibility tests.**
+Files: `crates/daemon/src/lib.rs`, `main.rs`, `service.rs`, `tests/service_cli_tests.rs`, `tests/service_state_tests.rs`.
 
-In `crates/daemon/tests/service_state_tests.rs`, add coverage that writes a `ServiceState` with `auto_refresh_seconds: Some(300)`, reads it back, and checks the value survives. Add a separate fixture containing the legacy JSON shape without the field and assert that deserialization produces `None`.
+- [x] Parse one optional `--auto-refresh-seconds` and `--endpoint` in either order.
+- [x] Accept `30..=86400`; reject missing/duplicate/invalid values with exit code `2`.
+- [x] Forward the optional value to hidden `service-run`.
+- [x] Store `ServiceState.auto_refresh_seconds: Option<u64>` with `#[serde(default)]`.
+- [x] Conditionally render JSON interval and text `auto refresh: <seconds>s`.
+- [x] Cover legacy state and configuration parsing, plus service lifecycle tests.
+- [x] Commit and push fd2f6a9.
 
-```rust
-let expected = ServiceState {
-    endpoint: "auto-refresh-test".to_owned(),
-    pid: 42,
-    index_path: PathBuf::from("index.json"),
-    started_unix_seconds: 1,
-    auto_refresh_seconds: Some(300),
-};
-write_service_state(&state_path, &expected).unwrap();
-assert_eq!(read_service_state(&state_path).unwrap(), Some(expected));
+Existing APIs to reuse: `parse_auto_refresh_seconds(&str) -> Option<u64>`, `read_state`, `write_state`, `render_status_text`, and `render_status_json`. Do not copy the previous plan's nonexistent `write_service_state` or alternate parser signature.
 
-std::fs::write(
-    &state_path,
-    r#"{"endpoint":"legacy","pid":42,"index_path":"index.json","started_unix_seconds":1}"#,
-)
-.unwrap();
-assert_eq!(read_service_state(&state_path).unwrap().unwrap().auto_refresh_seconds, None);
-```
+These checks describe the committed configuration scope, not fresh scheduler acceptance or proof that the timer runs.
 
-Add renderer assertions for both output modes:
+## Task 2: Persist And Enforce Scan Scope
 
-```rust
-assert!(render_status_json(&ServiceStatus::Running(running_with_auto.clone()))
-    .contains("\"auto_refresh_seconds\":300"));
-assert!(render_status_text(&ServiceStatus::Running(running_with_auto))
-    .contains("auto refresh: 300s"));
-assert!(!render_status_text(&ServiceStatus::Running(running_without_auto))
-    .contains("auto refresh:"));
-```
+Files: `crates/indexer/src/store.rs` and store tests; `crates/cli/src/lib.rs` and CLI tests; `crates/daemon/src/lib.rs` and handler/service tests.
 
-- [ ] **Step 2: Run the focused state test and confirm it fails for the missing field.**
+- [ ] Add failing policy serialization tests: sorted/deduplicated exclusion names, escaped values, known empty policy, absent legacy policy, malformed/unsupported policy version, and preservation across save/open.
+- [ ] Add failing tests proving automatic-start validation rejects unknown policy and ambiguous relative roots before spawning. An excluded directory must stay excluded through refresh and index status.
+- [ ] Add policy metadata to `FileIndexStore` using existing `meta` records and escaping. Preserve `aifs-index-v1` reads; no marker is `None`/unknown rather than an empty set.
+- [ ] Explicit CLI `index` records canonical absolute root and the requested policy. For an unknown legacy policy, instruct the user to rebuild explicitly; do not guess it during `refresh`.
+- [ ] For a known policy, omitted exclusions in CLI/daemon refresh and index status inherit stored scope; explicit matching exclusions are allowed and mismatches fail before scanning. Changing policy requires an explicit `index` rebuild.
+- [ ] Preserve legacy manual operation behavior and existing root mismatch errors. Policy metadata must never be silently dropped by the upgraded writer.
+- [ ] Test metadata-only additions, empty exclusion sets, root alias equality, index-inside-root exclusions, and older file reads. Document old-writer incompatibility.
+- [ ] Run focused indexer/CLI/daemon tests, then workspace tests; commit/push `feat: persist index scan policy`.
 
-Run:
+No timer is connected in this task. Do not assume the configuration parser alone performs these new startup checks.
 
-```powershell
-cargo test -p ai-file-search-daemon --test service_state_tests
-```
+## Task 3: Single Writer And Safe Publication
 
-Expected: compile failures referring to the missing `auto_refresh_seconds` field or assertions failing because the renderer has no configuration output.
+Files: `crates/indexer/src/store.rs`, an indexer-local writer guard helper if needed, indexer subprocess/storage tests, and all CLI/daemon write call sites.
 
-- [ ] **Step 3: Add the state field with backward-compatible serde behavior.**
+- [ ] Add real subprocess lock-contention tests for CLI/CLI, managed-service/CLI, daemon manual write/service, and second-service ownership of the same canonical index. Include release after normal exit and forced test-child termination.
+- [ ] Implement an indexer-owned RAII guard using a stable adjacent lock file and `std::fs::File::try_lock`. Hold it over old-index open, scan, comparison, and publication; a managed child holds it for its lifetime.
+- [ ] Make mutation/publication require the guard. Preserve existing read-only APIs; update every supported write entry point and its tests. Do not add a lock only to `service start` or acquire it only at `save()`.
+- [ ] Resolve relative/absolute and supported filesystem aliases to one lock identity. State limitations for hard-link aliases, mixed old writers, untrusted directories, and network filesystems. Never unlink the lock file on release or truncate an existing lock path.
+- [ ] Add injected failure tests for temporary creation, write, flush, sync, and replacement. Assert old index bytes remain unchanged for every pre-publication failure.
+- [ ] Test pre-existing temp-name collisions and links without requiring Windows symlink privileges: hard-link/collision tests run natively; conditional symlink coverage runs where permitted. Unrelated files must remain untouched.
+- [ ] Replace fixed `<index>.tmp` reuse with unique same-directory exclusive creation. Retry collisions; remove only files created by the current attempt. No unlink-old-index fallback.
+- [ ] Stream borrowed records through `BufWriter`, explicitly flush/sync, apply private permissions, close temporary handles as required, and atomically publish on supported local filesystems. Keep post-publication errors distinct from rollback.
+- [ ] Verify new and existing index publication on native Windows, Linux, and macOS, including read-only concurrent clients and rename/share-mode failure.
+- [ ] Run focused storage/subprocess tests and workspace tests; commit/push `fix: isolate index writers and publish snapshots safely`.
 
-In `crates/daemon/src/service.rs`, extend the exact persisted structure:
+Keep directory and endpoint access control distinct from cooperative locks. A lock is not protection against arbitrary same-user code or external processes ignoring the contract.
 
-```rust
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ServiceState {
-    pub endpoint: String,
-    pub pid: u32,
-    pub index_path: PathBuf,
-    pub started_unix_seconds: u64,
-    #[serde(default)]
-    pub auto_refresh_seconds: Option<u64>,
-}
-```
+## Task 4: Share Scan/Compare And Control Memory Copies
 
-In `render_status_json` and `render_status_text`, retain the current fields and only append `auto_refresh_seconds` to the running JSON payload when the option is `Some`. For text output, append exactly `auto refresh: <seconds>s` only when configured. Do not synthesize an `auto refresh: disabled` line; an absent configuration is the established default.
+Files: `crates/daemon/src/lib.rs`, `crates/indexer/src/store.rs`, their unit/handler tests.
 
-- [ ] **Step 4: Write failing CLI parser tests.**
+- [ ] Add failing internal tests for unchanged, added, updated, and removed files; exact no-write behavior; root/policy preservation; self-artifacts; missing root; and save failure.
+- [ ] Build one private scan/compare operation returning the actual `FileIndexStore`, candidate `Vec<IndexedFile>`, and `RefreshSummary`, with explicit runtime artifact paths and held writer ownership for mutations.
+- [ ] Use existing `replace_all(files)`, `set_root_path(...)`, and `save()` APIs, adapting ownership for the new guard. Do not invent `IndexStore`, `replace_files`, `save(index_path)`, or `summary.changed()`.
+- [ ] Define changed as `added != 0 || updated != 0 || removed != 0`. A helper is justified only if multiple call sites need it.
+- [ ] Automatic operations scan once and save only on change. Manual `refresh`/`reindex` keep their summary fields and current explicit-save behavior; `index_status` scans once and never mutates.
+- [ ] Add borrowed ordered iteration over saved records and compare sorted unique candidate entries without `all_files()` clones or additional path maps. Test equivalence with `RefreshSummary::compare`, including empty sets and metadata changes.
+- [ ] Stream index loading rather than keeping complete text alongside parsed records. Release scan/store buffers after the operation; do not cache a second complete snapshot at idle.
+- [ ] Exclude exact index, lock, resolved state, and owned temporary artifacts, including relative/absolute paths. Do not apply a blanket `.tmp` suffix filter.
+- [ ] Test one write for changed results and zero writes for unchanged results using a write spy or injectable publication boundary. Byte equality alone cannot prove no rewrite.
+- [ ] Run focused daemon/indexer tests and workspace tests; commit/push `refactor: share bounded-allocation index refresh`.
 
-In `crates/daemon/tests/service_cli_tests.rs`, add table-driven calls to the existing command test helper. Cover:
+Memory remains O(N) while scanning. Existing modification timestamps have second resolution; tests should change size or controlled metadata rather than relying on tiny wall-clock sleeps.
 
-```text
-service start index.json --auto-refresh-seconds 300                  => success
-service start index.json --endpoint endpoint --auto-refresh-seconds 300 => success
-service start index.json --auto-refresh-seconds 300 --endpoint endpoint => success
-service start index.json --auto-refresh-seconds 29                   => exit 2
-service start index.json --auto-refresh-seconds 86401                => exit 2
-service start index.json --auto-refresh-seconds nope                 => exit 2
-service start index.json --auto-refresh-seconds                      => exit 2
-service start index.json --auto-refresh-seconds 300 --auto-refresh-seconds 301 => exit 2
-```
+## Task 5: Bounded Managed IPC And Safe Lifecycle
 
-For parser-only tests, arrange the daemon state fixture so the command does not need to launch a real child process, following the existing `run_with_state` patterns. Assert an error message contains the option name and allowed range rather than pinning the complete wording.
+Files: `crates/daemon/src/lib.rs`, `service.rs`, `tests/transport_tests.rs`, `tests/service_cli_tests.rs`; add narrowly scoped private helpers when necessary.
 
-Also add a hidden-command test that invokes:
+- [ ] Test the actual managed Windows Named Pipe/Unix Socket loop with an idle connection, slow trickle, oversized/no-newline frame, EOF, disconnected response reader, and a client keeping a connection open after one response.
+- [ ] Use one request/response per managed connection, a 64-KiB capped incoming frame, total 5-second read deadline, and 5-second response-write deadline. Connection-local failure must not terminate the server.
+- [ ] Keep `handle_json_stream` for stdio's multi-request use and preserve manually started `ipc` compatibility separately. Test no-auto managed mode through the new bounded path too.
+- [ ] Preserve a pending listener/Named Pipe server across timer waits. Do not drop/recreate an unconnected pipe on every timer event; it should remain available while the serial owner is busy.
+- [ ] Pass the absolute resolved state path to the child runtime context, respecting `AIFS_SERVICE_STATE`, and avoid process-global environment mutation in parallel tests.
+- [ ] Bound client-side health/shutdown request I/O. A timeout or malformed state means unknown/busy/error, not permission to spawn over a live child or delete its endpoint.
+- [ ] Add managed-instance ownership covering the state/endpoint as well as the per-index guard. Check requested index/endpoint/config when reporting already running; do not silently say a different requested index was started.
+- [ ] Resolve a user-private absolute Unix endpoint under the runtime directory; enforce private directory/socket permissions. Use Windows first-pipe-instance protection and a current-user access policy before treating the service as a production boundary.
+- [ ] Never unconditionally delete a pre-existing endpoint path. With verified instance ownership, inspect socket type and liveness before stale cleanup; reject a regular file or foreign live endpoint. Remove only owned artifacts at shutdown.
+- [ ] Keep the startup `Child` handle. On readiness or state-write failure, stop and reap that owned child, and clean only owned state/endpoint files. A saved PID alone is not authority to kill a process.
+- [ ] Atomically write advisory state. Missing state is stopped only when ownership is absent; active startup is starting, and an active child without usable state is unresponsive. Malformed/unreadable state is an explicit error, not silently stopped. Use the background design's exact JSON status names; preserve existing healthy/stopped output.
+- [ ] Test simultaneous start, busy scan during start/status/stop, stale endpoint file, malformed state, timeout cleanup, index contention, custom endpoint, and failed state write.
+- [ ] Run focused native transport/lifecycle tests and workspace tests; commit/push `fix: bound managed IPC and protect service ownership`.
 
-```text
-service-run index.json endpoint --auto-refresh-seconds 300
-```
+Do not wrap a synchronous full scan in an async timeout and claim it is canceled. Scan latency still bounds responsiveness. ACL/peer authorization for arbitrary AI clients remains a separate production gate; local IPC alone provides no such guarantee.
 
-and verifies that `main.rs` accepts the argument shape and forwards it to the library. Keep that test non-blocking by testing parsing/dispatch extraction rather than running a persistent IPC server.
+## Task 6: Fixed-Delay Scheduler And Refresh Status
 
-- [ ] **Step 5: Run the focused CLI test and confirm it fails.**
+Files: `crates/daemon/src/lib.rs`, `crates/daemon/Cargo.toml` for Tokio test support only if needed, scheduler/handler/transport tests.
 
-Run:
+- [ ] Introduce a private deadline state: optional period plus optional next deadline. No configured period means no timer and no automatic scans.
+- [ ] Add deterministic paused-time tests BEFORE wiring production: first run after readiness plus one period, slow success/failure then full idle interval, machine suspension, successful manual reset, failed manual/read-only no reset, due-timer fairness, and no overlap.
+- [ ] Enable Tokio `test-util` in dev-only dependencies if paused-time tests require it. Reuse the existing Tokio version/features, not an unrelated test library.
+- [ ] Select `sleep_until(next_due)` against a cancel-safe accept/connect operation. Keep that transport state alive when the timer wins. Use explicit due-work priority so a flood of connections cannot postpone the scan forever.
+- [ ] Run one synchronous shared refresh attempt, then set the next deadline from COMPLETION, for both success and failure. Do not use `Interval`/`MissedTickBehavior::Skip` to approximate the fixed-delay requirement.
+- [ ] A successful manual `refresh`/`reindex` also resets the deadline. Shutdown is processed after the active operation completes; do not add a scan worker merely to mask that limitation.
+- [ ] Maintain a bounded in-memory last-attempt record and implement additive read-only `refresh_status`: enabled flag, configured period when present, never/unchanged/updated/failed outcome, last attempt/success times, summary, and sanitized error capped at 512 UTF-8 bytes.
+- [ ] Add catalog and handler tests for `refresh_status`; prove it performs no root scan, content read, or disk-state write, and failure/recovery records survive between requests but reset on restart.
+- [ ] Exercise actual managed platform loops with a due scan plus idle/malformed/oversized client. Verify subsequent requests and scheduled attempts still complete.
+- [ ] Remove the current ignored-interval placeholder only after Tasks 2-5 pass. Existing no-flag state rendering and manual RPC result fields remain compatible.
+- [ ] Run focused scheduler/handler/transport tests and workspace tests; commit/push `feat: run fixed-delay service auto refresh`.
 
-```powershell
-cargo test -p ai-file-search-daemon --test service_cli_tests
-```
+Detached stderr is not the diagnostic channel. `index_status` is not a substitute for refresh outcome: it performs another full scan and knows nothing about the last automatic attempt.
 
-Expected: the new flag is rejected as an unknown/invalid `service start` argument and hidden `service-run` rejects four arguments.
+## Task 7: Functional, Platform, And Performance Acceptance
 
-- [ ] **Step 6: Implement one canonical service-start argument parser.**
+Files: daemon functional tests, benchmark/test scripts where needed, native CI configuration, `README.md` and these documents.
 
-In `crates/daemon/src/lib.rs`, replace the positional-only `parse_service_start_args` result with a private parsed configuration type, for example:
-
-```rust
-const MIN_AUTO_REFRESH_SECONDS: u64 = 30;
-const MAX_AUTO_REFRESH_SECONDS: u64 = 86_400;
-
-struct ServiceStartArgs<'a> {
-    index_path: &'a str,
-    endpoint: String,
-    auto_refresh_seconds: Option<u64>,
-}
-```
-
-Parse flags in a small left-to-right loop after the required index path. Permit `--endpoint <name>` and `--auto-refresh-seconds <seconds>` in either order, reject duplicates, missing values, unknown flags, zero/non-numeric values, and values outside the inclusive constants. Return the existing command-level error shape so `run_async` returns `2` for usage errors.
-
-Keep the interval validation in a reusable private helper:
-
-```rust
-fn parse_auto_refresh_seconds(value: &str) -> Result<u64, String> {
-    let seconds = value.parse::<u64>().map_err(|_| {
-        format!("--auto-refresh-seconds must be an integer from {MIN_AUTO_REFRESH_SECONDS} to {MAX_AUTO_REFRESH_SECONDS}")
-    })?;
-    if !(MIN_AUTO_REFRESH_SECONDS..=MAX_AUTO_REFRESH_SECONDS).contains(&seconds) {
-        return Err(format!("--auto-refresh-seconds must be between {MIN_AUTO_REFRESH_SECONDS} and {MAX_AUTO_REFRESH_SECONDS} seconds"));
-    }
-    Ok(seconds)
-}
-```
-
-Thread `auto_refresh_seconds` through these existing call sites without changing the no-flag path:
-
-```rust
-service_start(index_path, endpoint, auto_refresh_seconds, state_path).await
-spawn_service_child(index_path, endpoint, auto_refresh_seconds)
-wait_for_started_service(endpoint, index_path, auto_refresh_seconds, state_path, pid).await
-service_run(index_path, endpoint, auto_refresh_seconds).await
-```
-
-When writing `ServiceState`, store the parsed value. In `crates/daemon/src/main.rs`, accept exactly the three-argument and five-argument hidden forms, validate the optional flag through the same public service-run entry point, and leave it hidden from normal command help.
-
-- [ ] **Step 7: Run formatting and focused tests.**
-
-Run:
+- [ ] Add a functional child-process test using an injected internal period/clock seam rather than accepting a sub-30-second production flag. Cover add/update/delete, unchanged no publication, policy preservation, failure/recovery, `refresh_status`, and real child exit on shutdown.
+- [ ] Keep one optional smoke with the real `--auto-refresh-seconds 30`. A status field alone is not acceptance: mutate files and observe a scheduled write. Cleanup in `finally` must stop/reap owned children and remove isolated endpoints/state.
+- [ ] Establish native Windows/Linux/macOS CI for formatting, workspace tests, clippy, managed transport, lock contention, and safe replacement. No existing `.github` workflow should be assumed. Report any unrun platform as unverified.
+- [ ] Run release-mode 10k/100k metadata fixtures, and a separately labeled 1M scale test. Include shallow/deep trees, long paths, exclusions, no-change scans, changed scans, and repeated refresh cycles.
+- [ ] Record OS/filesystem, CPU/RAM/storage, toolchain/commit, dataset, cold/warm conditions, process idle/peak/retained memory, idle CPU, scan/compare/save timings, write counts, and RPC P50/P95/max idle versus during scans.
+- [ ] Establish a measured baseline and platform budgets BEFORE claiming low-memory/high-performance acceptance. On the same pinned runner, gate unexplained peak-memory or latency regressions above 20%; investigate before adjusting a budget. Never compare unrelated hardware samples as a regression.
+- [ ] Report serial scan blocking explicitly. If it exceeds the product's accepted response-latency budget, keep automatic scanning experimental and open a separate cooperative-scan design; do not hide it with a generous socket timeout.
+- [ ] Update README to show auto refresh as implemented only after these gates. Document fixed delay, legacy rebuild, stored exclusions, writer contention, full-scan blocking, bounded service connections, `refresh_status`, restart configuration, and security limitations.
+- [ ] Run final verification once:
 
 ```powershell
 cargo fmt --check
-cargo test -p ai-file-search-daemon --test service_state_tests
-cargo test -p ai-file-search-daemon --test service_cli_tests
-```
-
-Expected: all pass, including legacy state parsing and invalid option paths.
-
-- [ ] **Step 8: Commit and push the configuration slice.**
-
-```powershell
-git add crates/daemon/src/lib.rs crates/daemon/src/main.rs crates/daemon/src/service.rs crates/daemon/tests/service_cli_tests.rs crates/daemon/tests/service_state_tests.rs
-git commit -m "feat: configure service auto refresh"
-git push origin main
-```
-
-## Task 2: Share the Scan/Compare Path and Avoid Unchanged Writes
-
-**Files:**
-- Modify: `crates/daemon/src/lib.rs`
-- Add or modify unit tests in: `crates/daemon/src/lib.rs`
-- Modify if needed: `crates/daemon/Cargo.toml`
-
-- [ ] **Step 1: Add failing internal refresh tests beside the private implementation.**
-
-Add a `#[cfg(test)] mod auto_refresh_tests` at the bottom of `crates/daemon/src/lib.rs`, where tests can exercise private helpers without expanding the crate's public API. Reuse `tempfile::tempdir()` and existing test fixture conventions. Cover these cases:
-
-1. An unchanged index returns `saved == false` and leaves the index bytes exactly unchanged.
-2. A newly created file returns `saved == true`, increments the added summary, and persists the new entry.
-3. A deleted file returns `saved == true`, increments removed, and removes the persisted entry.
-4. The index file and daemon state file are not indexed when the stored root is relative but the supplied index/state paths resolve to absolute paths.
-5. A missing or unreadable stored root returns an error and does not overwrite the old index file.
-
-Use a small result type internal to the module, not a JSON-RPC response:
-
-```rust
-let result = refresh_if_changed(&index_path).unwrap();
-assert!(!result.saved);
-assert_eq!(std::fs::read(&index_path).unwrap(), before);
-```
-
-- [ ] **Step 2: Run the library unit tests and confirm the helper does not exist.**
-
-Run:
-
-```powershell
-cargo test -p ai-file-search-daemon --lib
-```
-
-Expected: compilation failure for `refresh_if_changed` and its result type, or failing placeholders added in the preceding step.
-
-- [ ] **Step 3: Extract a private scan-and-compare primitive without altering RPC contracts.**
-
-In `crates/daemon/src/lib.rs`, identify the common work now repeated by `refresh` and `index_status`:
-
-1. Open the store and resolve the persisted root or an explicitly supplied root.
-2. Normalize index and service-state paths for self-exclusion.
-3. Walk the root and create candidate indexed files.
-4. Compare candidates to the stored entries to produce `added`, `updated`, `removed`, and `unchanged`.
-
-Represent that private result using owned data sufficient to apply it later, for example:
-
-```rust
-struct ScannedIndex {
-    store: IndexStore,
-    files: Vec<IndexedFile>,
-    summary: RefreshSummary,
-}
-```
-
-The exact existing store/file types should be used rather than duplicating serialized structures. Preserve current error messages for the public `refresh` and `index_status` methods by converting shared helper errors at their current response boundaries.
-
-Implement the scheduled path as a private operation:
-
-```rust
-struct AutoRefreshResult {
-    summary: RefreshSummary,
-    saved: bool,
-}
-
-fn refresh_if_changed(index_path: &Path) -> Result<AutoRefreshResult, String> {
-    let scanned = scan_stored_index(index_path)?;
-    let saved = scanned.summary.changed();
-    if saved {
-        scanned.store.replace_files(scanned.files);
-        scanned.store.save(index_path).map_err(|error| error.to_string())?;
-    }
-    Ok(AutoRefreshResult { summary: scanned.summary, saved })
-}
-```
-
-Use the project's existing definition of whether a refresh changed the index; if there is no helper today, define `RefreshSummary::has_changes()` as `added + updated + removed > 0`. Do not rewrite an unchanged store and do not update service-state JSON per tick.
-
-Manual JSON-RPC `refresh` must keep its existing externally observable behavior: scan once, replace/save once, and return its current summary. JSON-RPC `index_status` must remain read-only and must continue to discard the scanned file list after comparison.
-
-- [ ] **Step 4: Preserve failure safety and self-exclusion behavior.**
-
-Ensure `refresh_if_changed` completes all scanning and comparison before calling `replace_files` and `save`. On scan/root failure it returns an error without mutating in-memory data that will be persisted. Reuse the existing canonicalization-with-fallback comparison for exclusions; do not introduce raw-string path comparisons.
-
-- [ ] **Step 5: Run unit, handler, and workspace tests.**
-
-Run:
-
-```powershell
-cargo fmt --check
-cargo test -p ai-file-search-daemon --lib
-cargo test -p ai-file-search-daemon --test handler_tests
-cargo test --workspace
-```
-
-Expected: the new no-write/change/failure tests pass and existing manual refresh plus `index_status` behavior remains stable.
-
-- [ ] **Step 6: Commit and push the internal refresh slice.**
-
-```powershell
-git add crates/daemon/src/lib.rs crates/daemon/Cargo.toml
-git commit -m "feat: refresh service index only when changed"
-git push origin main
-```
-
-Only include `crates/daemon/Cargo.toml` if Task 3 test timing requires Tokio's `test-util` feature; otherwise omit it from this commit.
-
-## Task 3: Run the Cooperative Scheduler Inside Each IPC Loop
-
-**Files:**
-- Modify: `crates/daemon/src/lib.rs`
-- Modify: `crates/daemon/Cargo.toml` only if needed for deterministic paused-time tests
-- Modify: `crates/daemon/tests/transport_tests.rs`
-- Modify: `README.md`
-
-- [ ] **Step 1: Add deterministic scheduler tests before wiring production loops.**
-
-Add private Tokio tests in `lib.rs` for a small scheduler construction helper. If using Tokio paused time, add `test-util` to the existing Tokio feature list in `crates/daemon/Cargo.toml` and use:
-
-```rust
-#[tokio::test(start_paused = true)]
-async fn first_auto_refresh_tick_waits_for_the_configured_period() {
-    let mut interval = auto_refresh_interval(Some(Duration::from_secs(30))).unwrap();
-    assert!(tokio::time::timeout(Duration::from_secs(0), interval.tick()).await.is_err());
-    tokio::time::advance(Duration::from_secs(30)).await;
-    interval.tick().await;
-}
-```
-
-Add a second test that advances several periods while refresh work is considered occupied and verifies that the interval uses `MissedTickBehavior::Skip`, so at most one overdue refresh is handled when control returns. Keep the unit under test a scheduler helper or an injected `Interval`; do not make a test wait for real 30-second wall time.
-
-In `transport_tests.rs`, add a regression test that starts the IPC handler with automatic refresh disabled and verifies the existing request/response path is unchanged. This guards the default configuration while the platform loops are refactored.
-
-- [ ] **Step 2: Run focused tests and confirm the scheduler helper is absent.**
-
-Run:
-
-```powershell
-cargo test -p ai-file-search-daemon --lib
-cargo test -p ai-file-search-daemon --test transport_tests
-```
-
-Expected: failures for `auto_refresh_interval` or the missing timer behavior, while the pre-existing transport test should remain green.
-
-- [ ] **Step 3: Create an optional interval with delayed first tick and skip semantics.**
-
-In `crates/daemon/src/lib.rs`, import Tokio time types needed for an interval:
-
-```rust
-use tokio::time::{interval_at, sleep, Duration, Instant, Interval, MissedTickBehavior};
-```
-
-Implement a private constructor that creates no timer for `None` and a timer whose first tick is one complete period in the future:
-
-```rust
-fn auto_refresh_interval(period: Option<Duration>) -> Option<Interval> {
-    let period = period?;
-    let mut interval = interval_at(Instant::now() + period, period);
-    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    Some(interval)
-}
-```
-
-Production input has already been range-validated. Keep the helper generic over `Duration` so paused-time tests can use a short test duration without weakening CLI validation.
-
-- [ ] **Step 4: Extend the service-run path and Unix IPC loop.**
-
-Change the public internal entry point to receive configuration:
-
-```rust
-pub async fn service_run(
-    index_path: &Path,
-    endpoint: &str,
-    auto_refresh_seconds: Option<u64>,
-) -> i32
-```
-
-Convert seconds once to `Duration` and pass the resulting optional period into the platform server loop. Retain a small no-auto wrapper only if existing tests or callers need it.
-
-In the Unix socket loop, initialize one `Option<Interval>` outside the accept loop. With an active timer, use `tokio::select!` between `listener.accept()` and `timer.tick()`; on a tick call `refresh_if_changed(index_path)`. Log the error through the existing daemon stderr/logging convention and continue serving. On accept, retain the existing `handle_json_stream` behavior. With no timer, keep the current direct `accept().await` path to avoid incidental behavior changes.
-
-The tick branch must be awaited to completion before another select begins. This deliberately makes a full scan delay IPC requests, preventing overlapping scans, saves, or store races.
-
-- [ ] **Step 5: Apply the same serialized behavior to the Windows named-pipe loop.**
-
-For each iteration, create the next named-pipe server as today. When a timer exists, select between `server.connect()` and `timer.tick()`. If a tick wins, run `refresh_if_changed`, record any error, drop the unconnected server, and begin the next loop iteration. If connect wins, keep the present JSON stream handling. With no configured timer, leave the existing connect/handler code path unchanged.
-
-Do not create a second named-pipe server, Tokio task, channel, mutex, or background thread. The one loop must own both incoming connections and scheduled work.
-
-- [ ] **Step 6: Handle automatic refresh errors and shutdown correctly.**
-
-An automatic scan error must not terminate the daemon or overwrite the index. Emit a concise diagnostic containing `automatic refresh failed` and let the next interval try again. A shutdown signal that arrives during a scan is observed after that scan completes; no special cancellation or partial write mechanism is added in this MVP.
-
-- [ ] **Step 7: Update user documentation.**
-
-In `README.md`, add the opt-in command next to the existing service start example:
-
-```powershell
-ai-file-search-daemon service start <index-file> --auto-refresh-seconds 300
-```
-
-Document these exact semantics in the service behavior section:
-
-- disabled by default;
-- allowed range is 30 through 86,400 seconds;
-- first automatic scan happens after a full interval;
-- unchanged scans do not rewrite the index file;
-- automatic scans share the daemon loop with IPC and therefore wait/serialize with RPC work;
-- changing the interval requires `service stop` then `service start` again;
-- automatic failures preserve the last index and retry at the next scheduled interval.
-
-Also update the status output description to state that `auto_refresh_seconds` appears only while configured. Do not claim file-system watcher support.
-
-- [ ] **Step 8: Run full verification.**
-
-Run, in order:
-
-```powershell
-cargo fmt --check
-cargo test -p ai-file-search-daemon --lib
-cargo test -p ai-file-search-daemon --test service_state_tests
-cargo test -p ai-file-search-daemon --test service_cli_tests
-cargo test -p ai-file-search-daemon --test transport_tests
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 git diff --check
 git status --short
 ```
 
-Then perform a manual process smoke test with an interval that is valid but short enough to inspect without waiting too long only when the environment permits it; otherwise explicitly record that the deterministic paused-time tests cover timer timing. Verify:
+- [ ] Confirm expected tests actually ran with zero failures, no leaked child/endpoint/state, and no unrelated staged changes.
+- [ ] Commit/push acceptance artifacts with `git push origin main`; verify local and remote branch heads match. Do not mark unrun native/performance gates complete.
 
-```powershell
-ai-file-search-daemon service start .\index.json --auto-refresh-seconds 30
-ai-file-search-daemon service status --json
-ai-file-search-daemon service stop
-```
+## Review Exit Criteria
 
-The JSON status must contain `"auto_refresh_seconds":30`; stopping must leave no running service state.
-
-- [ ] **Step 9: Commit and push the scheduler and documentation.**
-
-```powershell
-git add crates/daemon/src/lib.rs crates/daemon/Cargo.toml crates/daemon/tests/transport_tests.rs README.md
-git commit -m "feat: add cooperative service auto refresh"
-git push origin main
-```
-
-Stage only files actually changed. Before committing, inspect `git diff --check`, the complete test output, and `git status --short`; do not include unrelated user changes.
-
-## Final Review Checklist
-
-- [ ] `service start` without the new option preserves existing behavior and status output.
-- [ ] Invalid refresh interval input exits with code `2`, including duplicate and missing-value cases.
-- [ ] Legacy state files load with automatic refresh disabled.
-- [ ] A changed automatic scan saves exactly once; an unchanged scan does not alter index bytes.
-- [ ] Existing `refresh`, `reindex`, and `index_status` JSON-RPC behavior and root validation remain covered by the workspace tests.
-- [ ] Both Unix and Windows IPC loops serialize automatic work with one accepted/connected request at a time.
-- [ ] Auto-refresh errors do not crash the daemon or replace its last good index.
-- [ ] README states the opt-in/default/range/restart semantics accurately.
+- [ ] Automatic refresh cannot broaden a saved known scan policy.
+- [ ] All supported writers share ownership; private temporary paths cannot overwrite a pre-existing link.
+- [ ] Pre-publication failures preserve the old snapshot; unchanged scans produce zero writes.
+- [ ] A slow completed attempt is followed by a full configured idle interval.
+- [ ] Idle/trickling clients and sustained read traffic cannot indefinitely prevent due work.
+- [ ] Shutdown, busy health checks, and stale recovery do not spawn duplicate services or kill unrelated processes.
+- [ ] No unbounded diagnostic history, full-snapshot formatting buffer, or idle retained scan snapshot is added.
+- [ ] Native platform and measured performance evidence are labeled separately from configuration-only and design-only progress.

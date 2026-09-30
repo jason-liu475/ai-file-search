@@ -1,10 +1,12 @@
 # Index Status JSON-RPC Design
 
+Reviewed: 2026-09-30. `index_status` is implemented; the scan-policy and bounded-allocation changes referenced below remain planned.
+
 ## Goal
 
 Add a read-only JSON-RPC method that lets local AI clients determine whether the saved file index is stale before requesting a write operation.
 
-The method must preserve the daemon's low-memory, local-only architecture and reuse the safety boundary already enforced by `refresh` and `reindex`.
+The method reuses the local transport and root safety boundary enforced by `refresh` and `reindex`. It performs O(N) metadata work and currently allocates snapshot copies; read-only does not mean low-cost or low-latency.
 
 ## Scope
 
@@ -75,6 +77,8 @@ Parameter rules:
 - When neither stored root metadata nor an explicit `root` exists, return `missing string param: root`.
 - `exclude_names` is optional and must be an array of strings.
 
+The current store does not persist exclusions; callers must repeat intended exclusions for current operations. After the [scan-policy prerequisite](2026-07-10-service-auto-refresh-design.md#scan-scope-and-compatibility) is implemented, omitted exclusions inherit a known stored policy, matching explicit exclusions are accepted, and mismatches fail before scanning. Legacy unknown policy retains manual compatibility; it cannot silently enable automatic scanning.
+
 ## Response Contract
 
 When changes exist:
@@ -111,7 +115,7 @@ When the index is current:
 
 `needs_refresh` is `true` when any of `added`, `updated`, or `removed` is greater than zero. The `unchanged` count does not affect it.
 
-JSON object key order is controlled by the existing serialization behavior and is asserted by handler tests where the repository already treats serialized lines as a stable interface.
+JSON object key order is not a semantic API contract. Test response values and framing; preserve existing wire output where practical without requiring clients to depend on serialization order.
 
 ## Data Flow
 
@@ -130,7 +134,7 @@ The daemon handler remains the owner of the operation. No new crate or dependenc
 
 The implementation should share small internal helpers with `refresh` only where this removes duplicated response construction or comparison logic. It must not broaden public APIs merely for this feature.
 
-The existing `refresh_root` helper may be renamed to reflect its use by both read-only status and refresh operations, provided behavior and error messages remain stable.
+The current root helper is `index_root`. Reuse it and preserve root mismatch behavior and error messages rather than following the old plan's obsolete helper name.
 
 ## Error Handling
 
@@ -181,4 +185,6 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ## Follow-Up
 
-After this method is stable, clients can poll it on demand or at a conservative interval and call `refresh` only when `needs_refresh` is true. Native file watching remains a separate future design because its correctness, resource use, and cross-platform behavior need independent evaluation.
+Use this method on demand when a client needs an exact metadata comparison without writing. Do not recommend it as a periodic health heartbeat: `index_status` followed by `refresh` scans the root twice, and a full scan blocks the current serial service.
+
+Scheduled refresh should scan/compare once and save only on change. The planned lightweight `refresh_status` method reports the last attempt without scanning; it is not implemented yet. Native file watching remains a separate design with independent correctness and resource budgets.

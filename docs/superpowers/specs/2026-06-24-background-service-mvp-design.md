@@ -1,10 +1,12 @@
 # Background Service MVP Design
 
+Reviewed: 2026-09-30. The managed-process MVP is implemented. The ownership, bounded-health-I/O, private-endpoint, atomic-state, and error-state corrections below are revised contracts, not claims that the current code already enforces them. They are prerequisites for unattended automatic refresh.
+
 ## Goal
 
 Make the daemon usable as a lightweight background process that can be started, checked, and stopped through cross-platform commands without requiring administrator privileges or OS service installation.
 
-This MVP turns the existing IPC daemon into a practical always-on local entry point for AI tools while keeping memory use, security exposure, and platform coupling low.
+This MVP offers a local entry point for AI tools without HTTP or administrator setup. Full scans still block the serial daemon and use O(N) metadata memory. Local IPC alone does not enforce a caller permission boundary.
 
 ## Scope
 
@@ -45,7 +47,7 @@ Use a managed background child process instead of OS service frameworks.
 `service start` launches the same executable in a hidden/background mode:
 
 ```text
-ai-file-search-daemon service-run <index-file> <endpoint>
+ai-file-search-daemon service-run <index-file> <endpoint> [--auto-refresh-seconds <seconds>]
 ```
 
 `service-run` serves the existing platform IPC transport and writes no interactive output except fatal errors. This keeps the service runtime path close to the already-tested `ipc` command while allowing `service start` to own state-file creation.
@@ -65,15 +67,13 @@ This approach is preferred because it:
 Behavior:
 
 1. Resolve `index-file` to an absolute path.
-2. Choose endpoint:
-   - Use `--endpoint <name>` when provided.
-   - Otherwise use the default `aifs-service`.
-3. Load the state file if it exists.
-4. If state exists and the endpoint answers `ping`, return success with a message that the service is already running.
-5. If state exists but does not answer `ping`, treat it as stale and replace it.
-6. Spawn `service-run <index-file> <endpoint>` as a detached/background child.
-7. Poll the endpoint briefly until `ping` succeeds.
-8. Write a state file with endpoint, pid, index path, and start timestamp.
+2. Resolve the exact state path, including `AIFS_SERVICE_STATE`, and the endpoint into a private per-user namespace. The prototype default remains `aifs-service`; the hardened Unix default must be an absolute path under a private runtime directory, and Windows needs first-instance protection and current-user access restrictions.
+3. Hold a short-lived startup coordination guard; inspect child-lifetime ownership separately. This lets the child acquire its lifetime guard before the parent publishes state and releases startup coordination, with no unowned handoff window.
+4. If state exists and `ping` succeeds, verify that the requested index/endpoint matches before reporting an already-running instance. Report that configuration is retained rather than pretending a new interval took effect.
+5. A failed or timed-out `ping` is unknown/busy, not proof of stale state. If startup or child-lifetime ownership is held, do not replace state, unlink the endpoint, or spawn a duplicate. Malformed state is an explicit error.
+6. Spawn `service-run` as a background child, retaining its `Child` handle. The child acquires managed-instance and index-writer ownership before binding. Pass absolute index/state paths and optional configuration explicitly.
+7. Poll readiness with bounded I/O. On readiness failure, stop and reap only the child spawned by this attempt; do not use an advisory saved PID as kill authority.
+8. Atomically publish state with endpoint, pid, index path, start timestamp, and optional interval. If this fails, stop/reap the owned child and clean only artifacts this attempt owns.
 9. Print a concise success message.
 
 Exit codes:
@@ -87,9 +87,9 @@ Exit codes:
 Behavior:
 
 1. Load the state file.
-2. If no state file exists, report `stopped`.
+2. If no state file exists and neither startup nor child-lifetime ownership is held, report `stopped`. If startup is active, report `starting`; a live owner without readable state is `unresponsive`, not stopped.
 3. If state exists and `ping` succeeds, report `running`.
-4. If state exists but `ping` fails, report `stale`.
+4. If state exists but `ping` fails, inspect managed ownership: a live owner is `unresponsive`, not `stale`. Report stale only when ownership is absent and endpoint cleanup is safe. Malformed or unreadable state is an error, not stopped.
 5. With `--json`, print a machine-readable object.
 
 Human output examples:
@@ -111,19 +111,21 @@ JSON output examples:
 Exit codes:
 
 - `0` for `running` and `stopped`
-- `1` for `stale`
+- `1` for `starting`, `unresponsive`, `stale`, or unreadable/malformed state
 - `2` for usage errors
+
+The revised machine-readable status names are exactly `running`, `stopped`, `starting`, `unresponsive`, `stale`, and `error`. Error output carries a concise reason; do not invent a separate `busy` status or require metadata fields when no readable state exists. Existing healthy/stopped JSON stays unchanged.
 
 ### `service stop`
 
 Behavior:
 
 1. Load the state file.
-2. If no state file exists, report that the service is already stopped and return success.
+2. If no state file exists and ownership is absent, report already stopped and return success. If an owner exists without usable state, report unresponsive with exit code `1` rather than claiming it stopped.
 3. Send JSON-RPC `shutdown` to the stored endpoint.
-4. Poll until `ping` fails or a short timeout expires.
-5. Remove the state file once the endpoint is no longer reachable.
-6. If shutdown cannot be delivered, report `stale` and leave removal to a later cleanup path.
+4. After shutdown acknowledgement, wait for owned lifetime/index guards and the endpoint to be released; process tests also confirm child exit. One failed `ping` is not enough to prove exit.
+5. Remove only matching owned state/endpoint artifacts after confirmed release. A regular file at the endpoint is never removed as stale socket cleanup.
+6. If shutdown cannot be delivered or the owner is busy, retain state and report the condition. Do not kill an unrelated PID or spawn a replacement to recover from a slow scan.
 
 Exit codes:
 
@@ -184,7 +186,9 @@ State schema:
 }
 ```
 
-The state file is advisory. The source of truth is the IPC `ping` result.
+The state file and PID are advisory. A successful `ping` proves an endpoint responded, not ownership of the intended index; a failed `ping` does not prove process death. Reconcile bounded health checks with managed-instance/index guards and matching identity before startup, cleanup, or stop decisions.
+
+Write state atomically, do not rewrite it per automatic scan, and pass the resolved absolute state path to the child for artifact self-exclusion. Configuration-only state is not evidence that scheduled refresh has run.
 
 ## Internal Components
 
@@ -227,9 +231,9 @@ Responsibilities:
 
 - Invalid CLI arguments return exit code `2`.
 - Missing state file is not an error for `status` or `stop`.
-- Unreachable endpoint with a state file is `stale`.
-- Failure to write state after successful startup should stop the child through `shutdown` when possible, then return an error.
-- Malformed state file is treated as `stale` and can be replaced by `service start`.
+- Unreachable endpoint with held ownership is unresponsive; do not assume stale from a timeout.
+- Failure to write state or become ready must stop and reap the child created by this attempt, then report the error.
+- Malformed state is an explicit readable error and must not trigger blind replacement or silently report stopped.
 - Existing `ipc` behavior remains unchanged for manually started daemon processes.
 
 ## Testing Strategy
@@ -240,7 +244,10 @@ Add tests for:
 
 - State file round trip
 - Missing state file reports stopped
-- Malformed state file reports stale or readable error state
+- Malformed state file reports an explicit error, not stopped
+- Concurrent start and a busy live owner do not create a duplicate child
+- Readiness/state-write failure reaps the owned child and preserves unrelated artifacts
+- Endpoint cleanup rejects a regular file or foreign live socket
 - JSON status rendering
 - `ping` JSON-RPC response
 - `shutdown` JSON-RPC response
@@ -282,9 +289,12 @@ This MVP exposes local-only IPC, not HTTP. The service endpoint is intended for 
 
 Security-sensitive follow-ups:
 
-- Restrict Named Pipe and Unix Socket permissions where supported.
+- Restrict Named Pipe and Unix Socket permissions before production or unattended use; use private per-user directories/namespaces and first-instance protection.
+- Never unlink a pre-existing endpoint without verified ownership, socket-type inspection, and safe stale detection.
 - Add an optional per-user token or peer-credential check.
 - Define a separate safe read-only API profile for AI clients.
+
+For scheduled operation, follow the [reviewed automatic-refresh prerequisites](2026-07-10-service-auto-refresh-design.md): persisted scan scope, all-writer locking, exclusive temporary creation, failure-safe replacement, and one bounded request per managed connection. Strong AI-client authorization remains a separate production gate.
 
 ## Open Source Fit
 

@@ -14,9 +14,13 @@ The project starts with a Rust core and a CLI prototype before adding the deskto
 
 ## Current Status
 
-Milestone 1 is being built: Rust workspace, core path model, recursive scanner, in-memory index store, file-backed index store, CLI commands, and benchmark fixtures.
+Implemented prototype slices include the Rust core/scanner, in-memory and text-file stores, CLI commands, metadata JSON-RPC over stdio/local IPC, manual refresh/reindex/index status, and user-level service start/status/stop.
 
-The current CLI is usable for local experiments. It is not yet a production desktop app.
+The CLI and local daemon are usable for experiments. They are not yet a production desktop app or an authenticated AI data-access boundary.
+
+Automatic refresh is configuration-only at commit `fd2f6a9`: `--auto-refresh-seconds` is parsed and recorded, but `service-run` does not schedule scans yet. Use manual `refresh` until runtime implementation and acceptance tests are complete.
+
+The [reviewed automatic-refresh design](docs/superpowers/specs/2026-07-10-service-auto-refresh-design.md) and [implementation plan](docs/superpowers/plans/2026-07-10-service-auto-refresh.md) separate completed configuration from pending scope persistence, writer isolation, safe publication, bounded connections, scheduling, and platform/performance gates.
 
 ## Quick Start
 
@@ -145,7 +149,7 @@ ai-file-search fixture <root> <count>
 ai-file-search-daemon stdio <index-file>
 ai-file-search-daemon ipc <index-file> <endpoint>
 ai-file-search-daemon ipc-request <endpoint> [json-line]
-ai-file-search-daemon service start <index-file> [--endpoint <name>]
+ai-file-search-daemon service start <index-file> [--endpoint <name>] [--auto-refresh-seconds <seconds>]
 ai-file-search-daemon service status [--json]
 ai-file-search-daemon service stop
 ```
@@ -164,6 +168,7 @@ Current behavior:
 - `ai-file-search-daemon ipc` serves the same JSON-RPC protocol over Windows Named Pipe or Unix Domain Socket for local long-lived clients.
 - `ai-file-search-daemon ipc-request` sends one newline-delimited JSON-RPC request to a local IPC endpoint, either from stdin or the optional command argument.
 - `ai-file-search-daemon service start/status/stop` manages a user-level background daemon over the platform IPC transport.
+- `--auto-refresh-seconds` accepts `30..=86400` and appears in service status only when configured. It currently records configuration only; it does not run automatic refresh.
 - `ai-file-search-daemon service start` requires an index file with stored root metadata; `index_status`, `refresh`, and `reindex` reject explicit roots that differ from that stored root.
 - `--exclude-name <name>` can be repeated on scanning commands to skip directories with an exact file name match, such as `node_modules`, `.git`, or `target`.
 
@@ -187,9 +192,15 @@ shutdown -> asks the daemon to stop
 - The persistent store is a simple versioned text file, not SQLite, Tantivy, or an external database.
 - Search is file-name substring search only.
 - File watching and true incremental updates are not implemented yet; `index_status` and `refresh` currently perform full rescans.
+- Automatic refresh scheduling is not implemented yet. `index_status` is a full scan, not a cheap health check; calling it and then `refresh` performs two scans.
+- Scan exclusions are not persisted yet. Repeat the intended exclusions on current manual scan/refresh operations; planned automatic startup will reject unknown scan policies rather than silently scan excluded directories.
+- Current full scans/load/save use O(N) metadata memory and additional clones/text buffers. Large-index peak memory, scan latency, and cross-platform performance budgets have not been validated.
+- `stats` avoids rescanning the filesystem root, but currently still loads and parses the entire saved index; it is not a constant-time metadata lookup.
+- Cross-process writer locks and unique exclusive temporary-file publication are pending. Avoid concurrent writers to the same index, and keep index/state/endpoint files in a trusted user-controlled directory.
 - OS service installation, start-on-login, authentication, and multi-user access controls are not implemented yet.
+- Managed IPC still needs bounded connections, safe stale-endpoint cleanup, and stronger instance ownership. Local-only transport does not by itself authorize callers or isolate users.
 - Content indexing is not implemented yet.
-- Desktop UI and AI-facing local API are planned after the CLI/core path is stable.
+- Desktop UI and a production-safe AI authorization profile are planned after the CLI/core path is stable; the prototype local JSON-RPC API already exists.
 
 ## Development
 

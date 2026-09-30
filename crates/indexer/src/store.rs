@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 #[cfg(test)]
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -85,6 +85,14 @@ impl MemoryIndexStore {
     #[must_use]
     pub fn all_files(&self) -> Vec<IndexedFile> {
         self.files.values().cloned().collect()
+    }
+
+    /// Borrows records in normalized path order without cloning the snapshot.
+    #[must_use]
+    pub fn iter_files(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = &IndexedFile> + ExactSizeIterator + '_ {
+        self.files.values()
     }
 
     #[must_use]
@@ -173,68 +181,88 @@ impl FileIndexStore {
     /// Returns an error when the index cannot be read or its scan policy metadata
     /// is malformed or uses an unsupported version.
     pub fn open(path: &Path) -> io::Result<Self> {
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::new(path)),
+            Err(error) => return Err(error),
+        };
+        Self::from_reader(path, BufReader::new(file))
+    }
+
+    fn from_reader(path: &Path, mut reader: impl BufRead) -> io::Result<Self> {
         let mut memory = MemoryIndexStore::new();
+        let mut root_path = None;
+        let mut policy_seen = false;
+        let mut exclusions_seen = false;
+        let mut policy_options = ScanOptions::default();
+        let mut first_line = true;
+        let mut has_header = false;
+        let mut line = String::new();
 
-        if path.exists() {
-            let contents = fs::read_to_string(path)?;
-            let mut lines = contents.lines();
-            let has_header = lines.next().is_some_and(|line| line == INDEX_HEADER);
-            let records: Box<dyn Iterator<Item = &str> + '_> = if has_header {
-                Box::new(lines)
-            } else {
-                Box::new(contents.lines())
-            };
-            let mut root_path = None;
-            let mut policy_seen = false;
-            let mut exclusions_seen = false;
-            let mut policy_options = ScanOptions::default();
-
-            for line in records.filter(|line| !line.is_empty()) {
-                if has_header {
-                    let mut parts = line.splitn(3, '\t');
-                    match (parts.next(), parts.next()) {
-                        (Some("meta"), Some("scan_policy")) => {
-                            if policy_seen || parts.next() != Some("1") {
-                                return Err(invalid_scan_policy());
-                            }
-                            policy_seen = true;
-                            continue;
-                        }
-                        (Some("meta"), Some("exclude_name")) => {
-                            let Some(value) = parts.next() else {
-                                return Err(invalid_scan_policy());
-                            };
-                            exclusions_seen = true;
-                            policy_options =
-                                policy_options.exclude_name(unescape_metadata_value(value));
-                            continue;
-                        }
-                        _ => {}
-                    }
-                    if let Some(root) = parse_root_metadata_record(line) {
-                        root_path = Some(root);
-                        continue;
-                    }
-                    if is_metadata_record(line) {
-                        continue;
-                    }
+        loop {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 {
+                break;
+            }
+            // Match str::lines: strip CR only when it belongs to a CRLF ending.
+            if line.ends_with('\n') {
+                line.pop();
+                if line.ends_with('\r') {
+                    line.pop();
                 }
-                memory.upsert_file(parse_index_record(line, has_header));
             }
-
-            if exclusions_seen && !policy_seen {
-                return Err(invalid_scan_policy());
+            if first_line {
+                first_line = false;
+                has_header = line == INDEX_HEADER;
+                if has_header {
+                    continue;
+                }
             }
-
-            return Ok(Self {
-                path: path.to_owned(),
-                memory,
-                root_path,
-                scan_policy: policy_seen.then_some(policy_options),
-            });
+            if line.is_empty() {
+                continue;
+            }
+            if has_header {
+                let mut parts = line.splitn(3, '\t');
+                match (parts.next(), parts.next()) {
+                    (Some("meta"), Some("scan_policy")) => {
+                        if policy_seen || parts.next() != Some("1") {
+                            return Err(invalid_scan_policy());
+                        }
+                        policy_seen = true;
+                        continue;
+                    }
+                    (Some("meta"), Some("exclude_name")) => {
+                        let Some(value) = parts.next() else {
+                            return Err(invalid_scan_policy());
+                        };
+                        exclusions_seen = true;
+                        policy_options =
+                            policy_options.exclude_name(unescape_metadata_value(value));
+                        continue;
+                    }
+                    _ => {}
+                }
+                if let Some(root) = parse_root_metadata_record(&line) {
+                    root_path = Some(root);
+                    continue;
+                }
+                if is_metadata_record(&line) {
+                    continue;
+                }
+            }
+            memory.upsert_file(parse_index_record(&line, has_header));
         }
 
-        Ok(Self::new(path))
+        if exclusions_seen && !policy_seen {
+            return Err(invalid_scan_policy());
+        }
+
+        Ok(Self {
+            path: path.to_owned(),
+            memory,
+            root_path,
+            scan_policy: policy_seen.then_some(policy_options),
+        })
     }
 
     #[must_use]
@@ -269,6 +297,14 @@ impl FileIndexStore {
     #[must_use]
     pub fn all_files(&self) -> Vec<IndexedFile> {
         self.memory.all_files()
+    }
+
+    /// Borrows records in normalized path order without cloning the snapshot.
+    #[must_use]
+    pub fn iter_files(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = &IndexedFile> + ExactSizeIterator + '_ {
+        self.memory.iter_files()
     }
 
     #[must_use]
@@ -607,6 +643,111 @@ fn temporary_index_path(path: &Path, id: u64) -> io::Result<PathBuf> {
     let mut temporary_name = publication_prefix(path);
     temporary_name.push(format!("{}-{id}", std::process::id()));
     Ok(path.with_file_name(temporary_name))
+}
+
+#[cfg(test)]
+mod streaming_load_tests {
+    use std::io::{BufReader, Read};
+
+    use super::*;
+
+    #[test]
+    fn tiny_buffers_preserve_unicode_crlf_duplicates_and_final_bare_cr() {
+        let text = "aifs-index-v1\r\n\r\nmeta\troot\troot\\tname\r\nmeta\texclude_name\t.git\r\n7\t11\t\u{6587}/a.txt\r\nmeta\tscan_policy\t1\r\n9\t13\t\u{6587}/a.txt\r\n5\t6\tz.txt\r";
+        for capacity in 1..=17 {
+            let reader = BufReader::with_capacity(capacity, text.as_bytes());
+            let store = FileIndexStore::from_reader(Path::new("unused-index.txt"), reader).unwrap();
+            assert_eq!(
+                store.all_files(),
+                vec![
+                    indexed_file("z.txt\r", 5, 6),
+                    indexed_file("\u{6587}/a.txt", 9, 13),
+                ]
+            );
+            assert_eq!(store.root_path(), Some(Path::new("root\tname")));
+            assert_eq!(
+                store.scan_policy(),
+                Some(&ScanOptions::default().exclude_name(".git"))
+            );
+        }
+    }
+
+    #[test]
+    fn tiny_buffers_do_not_drop_the_headerless_first_line() {
+        let text = "\u{6587}/first.txt\r\n\r\nlast\rname.txt\r";
+        for capacity in 1..=17 {
+            let reader = BufReader::with_capacity(capacity, text.as_bytes());
+            let store = FileIndexStore::from_reader(Path::new("unused-index.txt"), reader).unwrap();
+            assert_eq!(
+                store.all_files(),
+                vec![
+                    indexed_file("last\rname.txt\r", 0, 0),
+                    indexed_file("\u{6587}/first.txt", 0, 0),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn read_errors_before_or_after_records_never_return_a_snapshot() {
+        for prefix in [
+            "",
+            "first.txt\n",
+            "first.txt\npartial",
+            "aifs-index-v1\n7\t11\tfirst.txt\n",
+            "aifs-index-v1\nmeta\tscan_policy\t1\n",
+        ] {
+            let reader = BufReader::with_capacity(
+                3,
+                FailingReader {
+                    prefix: prefix.as_bytes(),
+                },
+            );
+            let error =
+                FileIndexStore::from_reader(Path::new("unused-index.txt"), reader).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(error.to_string(), "injected read failure");
+        }
+    }
+
+    #[test]
+    fn tiny_buffers_reject_split_invalid_utf8_after_a_valid_record() {
+        for text in [
+            &b"first.txt\ninvalid\xff.txt\n"[..],
+            &b"aifs-index-v1\n7\t11\tfirst.txt\n9\t13\tinvalid\xc3"[..],
+        ] {
+            for capacity in 1..=5 {
+                let reader = BufReader::with_capacity(capacity, text);
+                let error =
+                    FileIndexStore::from_reader(Path::new("unused-index.txt"), reader).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            }
+        }
+    }
+
+    struct FailingReader<'a> {
+        prefix: &'a [u8],
+    }
+
+    impl Read for FailingReader<'_> {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if self.prefix.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected read failure",
+                ));
+            }
+            self.prefix.read(output)
+        }
+    }
+
+    fn indexed_file(path: &str, size_bytes: u64, modified_unix_seconds: u64) -> IndexedFile {
+        IndexedFile {
+            relative_path: PathId::from_user_path(path),
+            size_bytes,
+            modified_unix_seconds,
+        }
+    }
 }
 
 #[cfg(test)]

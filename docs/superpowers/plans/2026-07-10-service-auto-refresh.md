@@ -7,12 +7,12 @@ Reviewed: 2026-09-30. Implement in the existing main checkout. This revision rep
 - [x] Task 1: interval configuration only, committed as fd2f6a9.
 - [x] Task 2: persist and enforce scan scope.
 - [x] Task 3: single-writer ownership and safe snapshot publication (Windows verification; native Linux/macOS gates remain open).
-- [ ] Task 4: shared scan/compare and controlled allocations.
+- [x] Task 4: shared scan/compare and controlled allocations (Windows structural/functional verification; measured memory budgets remain Task 7).
 - [ ] Task 5: bounded managed IPC and safe lifecycle.
 - [ ] Task 6: fixed-delay scheduler and last-attempt status.
 - [ ] Task 7: platform, performance, and documentation acceptance.
 
-The current `service_run` uses `auto_refresh_seconds` only to validate root/policy prerequisites, not to schedule scans. Tasks 1-3 are implemented; Tasks 4-7 remain planned. The Task 3 native Linux/macOS acceptance item below remains unverified and is required before claiming cross-platform completion. Do not enable or advertise automatic refresh before their safety gates pass.
+The current `service_run` uses `auto_refresh_seconds` only to validate root/policy prerequisites, not to schedule scans. Tasks 1-4 are implemented; Tasks 5-7 remain planned, with state-path forwarding already delivered in Task 4. The Task 3 native Linux/macOS acceptance item below remains unverified and is required before claiming cross-platform completion. Do not enable or advertise automatic refresh before their safety gates pass.
 
 **Stack:** Rust edition 2024, MSRV 1.96, existing Tokio IPC/time support, serde/serde_json, and repository temporary-directory test helpers. There is no existing `tempfile` dependency; reuse local helpers rather than adding one implicitly.
 
@@ -78,20 +78,24 @@ Keep directory and endpoint access control distinct from cooperative locks. A lo
 
 ## Task 4: Share Scan/Compare And Control Memory Copies
 
-Files: `crates/daemon/src/lib.rs`, `crates/indexer/src/store.rs`, their unit/handler tests.
+Files: `crates/daemon/src/lib.rs` and shared-refresh tests; `crates/indexer/src/store.rs`, `comparison.rs`, `scanner.rs` and loading/comparison/artifact tests; CLI comparison call sites and tests.
 
-- [ ] Add failing internal tests for unchanged, added, updated, and removed files; exact no-write behavior; root/policy preservation; self-artifacts; missing root; and save failure.
-- [ ] Build one private scan/compare operation returning the actual `FileIndexStore`, candidate `Vec<IndexedFile>`, and `RefreshSummary`, with explicit runtime artifact paths and held writer ownership for mutations.
-- [ ] Use existing `replace_all(files)`, `set_root_path(...)`, and `save()` APIs, adapting ownership for the new guard. Do not invent `IndexStore`, `replace_files`, `save(index_path)`, or `summary.changed()`.
-- [ ] Define changed as `added != 0 || updated != 0 || removed != 0`. A helper is justified only if multiple call sites need it.
-- [ ] Automatic operations scan once and save only on change. Manual `refresh`/`reindex` keep their summary fields and current explicit-save behavior; `index_status` scans once and never mutates.
-- [ ] Add borrowed ordered iteration over saved records and compare sorted unique candidate entries without `all_files()` clones or additional path maps. Test equivalence with `RefreshSummary::compare`, including empty sets and metadata changes.
-- [ ] Stream index loading rather than keeping complete text alongside parsed records. Release scan/store buffers after the operation; do not cache a second complete snapshot at idle.
-- [ ] Exclude exact index, lock, resolved state, and owned temporary artifacts, including relative/absolute paths. Do not apply a blanket `.tmp` suffix filter.
-- [ ] Test one write for changed results and zero writes for unchanged results using a write spy or injectable publication boundary. Byte equality alone cannot prove no rewrite.
-- [ ] Run focused daemon/indexer tests and workspace tests; commit/push `refactor: share bounded-allocation index refresh`.
+- [x] Add failing internal tests for unchanged, added, updated, and removed files; exact no-write behavior; root/policy preservation; self-artifacts; missing root; and save failure.
+- [x] Build private `scan_and_compare`, borrowing the actual `FileIndexStore` (or writer's immutable dereference) and returning resolved root, candidate `Vec<IndexedFile>`, and `RefreshSummary`, with explicit runtime artifact paths and held writer ownership for mutations. Borrowing keeps the existing writer capability intact and avoids copying/rewrapping the saved snapshot.
+- [x] Use existing `replace_all(files)`, `set_root_path(...)`, and `save()` APIs through guarded `FileIndexWriter` and private `publish_comparison`. No alternate store/save API is introduced.
+- [x] Define changed as `added != 0 || updated != 0 || removed != 0`. `RefreshSummary::has_changes` is shared by status and conditional publication.
+- [x] Prepare conditional publication for future automatic operations: one shared scan, save only on change. The production helper is tested with `save_only_if_changed = true`; no scheduler invokes it yet. Manual `refresh`/`reindex` use false and keep their summary fields/current explicit-save behavior; `index_status` scans once and never mutates.
+- [x] Add borrowed ordered iteration over saved records and compare sorted candidate entries without `all_files()` clones or additional path maps. Adjacent duplicates keep the last record, preserving the old map behavior. Five comparison tests cover 4096 metadata-state pairs, empty sets, metadata changes, normalized/Unicode paths, duplicate runs and single-pass iterator consumption.
+- [x] Stream index loading rather than keeping complete text alongside parsed records. Reuse one line buffer, distinguish NotFound from actual open/read errors, preserve str::lines/legacy/policy behavior, and reject partial invalid-UTF-8 snapshots. Scoped tests include 20000 records, long records and tiny split read buffers. No parsed map or scan vector is cached at service idle.
+- [x] Exclude exact index, lock, resolved managed state, and index-publication namespace, including relative/absolute paths. `Scanner::scan_for_index_with_artifacts` accepts explicit runtime paths. A child-specific absolute `AIFS_SERVICE_STATE` override is built from the actual startup path; no process-global environment mutation or generic state-name/.tmp suffix filter is used.
+- [x] Prove one scan/one write for changed results and one scan/zero writes for unchanged conditional results with spies. Prove unchanged manual refresh still attempts replacement via a Windows share-mode gate. Read-only status has no publication path; real replacement failure preserves published bytes.
+- [x] Run focused tests and one workspace suite: 204 Windows tests pass, 42 added (17 loading/iteration, 9 comparison/artifact, 2 CLI, 14 daemon). Three top-level ignored subprocess helpers are exercised by parent tests. Workspace fmt, Clippy and diff checks pass. Deliver as `refactor: share bounded-allocation index refresh`.
 
 Memory remains O(N) while scanning. Existing modification timestamps have second resolution; tests should change size or controlled metadata rather than relying on tiny wall-clock sleeps.
+
+Three workers delivered storage loading, CLI call sites and daemon shared operations; the main thread delivered ordered comparison, runtime identity resolution, integration review and docs. Real child-process tests cover managed absolute/relative custom state inside the scanned root, status/refresh/reindex/query scope preservation, and keeping similarly named user files visible. Command construction separately proves an explicit custom startup state overrides inherited environment and is absolute. Process audit found no remaining test/service child.
+
+Loading's extra buffer is O(read buffer + longest record), and ordered comparison's extra storage is O(1); this is source/test evidence, not a measured process-memory reduction. Parsed saved metadata and candidates remain O(N). The 20000-record loading case is a functional test, not large-scale latency or RSS acceptance. Only x86_64-pc-windows-msvc is installed/verified here; native Linux/macOS and Task 7 performance gates remain open. Task 5 endpoint/state ownership, bounded IPC/client health I/O and Task 6 timer/status are unchanged and unimplemented.
 
 ## Task 5: Bounded Managed IPC And Safe Lifecycle
 
@@ -101,7 +105,7 @@ Files: `crates/daemon/src/lib.rs`, `service.rs`, `tests/transport_tests.rs`, `te
 - [ ] Use one request/response per managed connection, a 64-KiB capped incoming frame, total 5-second read deadline, and 5-second response-write deadline. Connection-local failure must not terminate the server.
 - [ ] Keep `handle_json_stream` for stdio's multi-request use and preserve manually started `ipc` compatibility separately. Test no-auto managed mode through the new bounded path too.
 - [ ] Preserve a pending listener/Named Pipe server across timer waits. Do not drop/recreate an unconnected pipe on every timer event; it should remain available while the serial owner is busy.
-- [ ] Pass the absolute resolved state path to the child runtime context, respecting `AIFS_SERVICE_STATE`, and avoid process-global environment mutation in parallel tests.
+- [x] Delivered in Task 4: pass the absolute resolved state path to the child runtime context, respecting `AIFS_SERVICE_STATE`, and avoid process-global environment mutation in parallel tests. Task 5 still owns the state/endpoint lifecycle safety work.
 - [ ] Bound client-side health/shutdown request I/O. A timeout or malformed state means unknown/busy/error, not permission to spawn over a live child or delete its endpoint.
 - [ ] Add managed-instance ownership covering the state/endpoint as well as the per-index guard. Check requested index/endpoint/config when reporting already running; do not silently say a different requested index was started.
 - [ ] Resolve a user-private absolute Unix endpoint under the runtime directory; enforce private directory/socket permissions. Use Windows first-pipe-instance protection and a current-user access policy before treating the service as a production boundary.

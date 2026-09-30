@@ -14,13 +14,13 @@ The project starts with a Rust core and a CLI prototype before adding the deskto
 
 ## Current Status
 
-Implemented prototype slices include the Rust core/scanner, in-memory and text-file stores, persisted scan exclusions, guarded index writers, safe snapshot publication, CLI commands, metadata JSON-RPC over stdio/local IPC, manual refresh/reindex/index status, and user-level service start/status/stop.
+Implemented prototype slices include the Rust core/scanner, in-memory and streaming text-file stores, persisted scan exclusions, guarded index writers, safe snapshot publication, borrowed ordered metadata comparison, CLI commands, metadata JSON-RPC over stdio/local IPC, manual refresh/reindex/index status, and user-level service start/status/stop.
 
 The CLI and local daemon are usable for experiments. They are not yet a production desktop app or an authenticated AI data-access boundary.
 
 Automatic refresh is configuration-only at commit `fd2f6a9`: `--auto-refresh-seconds` is parsed and recorded, but `service-run` does not schedule scans yet. Use manual `refresh` until runtime implementation and acceptance tests are complete.
 
-The [reviewed automatic-refresh design](docs/superpowers/specs/2026-07-10-service-auto-refresh-design.md) and [implementation plan](docs/superpowers/plans/2026-07-10-service-auto-refresh.md) separate completed configuration, scan-policy persistence, writer isolation and publication from pending allocation improvements, bounded connections, scheduling, and platform/performance gates.
+The [reviewed automatic-refresh design](docs/superpowers/specs/2026-07-10-service-auto-refresh-design.md) and [implementation plan](docs/superpowers/plans/2026-07-10-service-auto-refresh.md) separate completed configuration, scan-policy persistence, writer isolation, streaming publication/loading and borrowed comparison from pending bounded connections, scheduling, and platform/performance gates.
 
 ## Quick Start
 
@@ -176,6 +176,8 @@ Current behavior:
 - CLI `index`/`refresh` and direct/stdio RPC writes acquire one nonblocking writer lock before opening or scanning. Manual IPC and managed service processes hold it for their entire lifetime and reuse it for their own refresh requests. External writes fail with `index is busy`; query/stat/status reads do not acquire this lock. Send refresh to the owning service or stop it before using CLI writes.
 - `<index-filename>.lock` remains beside the index after exit. Do not delete it to clear contention: the OS releases ownership when the process exits. Scanning excludes this index, its lock and its adjacent `.<index-filename>.aifs-tmp-*` publication namespace, not arbitrary `.tmp` files.
 - Snapshot save streams into an exclusively created same-directory temporary file, flushes/syncs/closes it, then replaces the destination without deleting the old index first. A failure before replacement preserves the old bytes and cleans only this attempt's temporary file. A crash can leave a reserved temporary artifact; it is not indexed or reused.
+- Managed RPC scans also exclude the actual service-state file, including a relative `AIFS_SERVICE_STATE` resolved at startup and explicitly forwarded to the child. This is an exact path exclusion, not a generic `service-state.json` name filter. Direct/stdio/manual IPC calls have no managed-state context and do not guess which user files to hide.
+- Manual `refresh`/`reindex` still publish explicitly even with zero file changes. The shared refresh operation has a tested conditional-publication mode for the future scheduler, but no automatic timer is connected yet. `index_status` uses the same scan/compare path and never publishes.
 
 ## JSON-RPC Methods
 
@@ -199,7 +201,7 @@ shutdown -> asks the daemon to stop
 - File watching and true incremental updates are not implemented yet; `index_status` and `refresh` currently perform full rescans.
 - Automatic refresh scheduling is not implemented yet. `index_status` is a full scan, not a cheap health check; calling it and then `refresh` performs two scans.
 - Legacy scan policy is unknown until an explicit rebuild. Older readers can query new metadata, but older writers drop policy records; do not mix old and new writers. Malformed or unsupported policy metadata is rejected without changing the file.
-- Current full scans/load use O(N) metadata memory and additional clones/text buffers. Save now streams borrowed records, but loading and comparison still allocate extra copies. Large-index peak memory, scan latency, and cross-platform performance budgets have not been validated.
+- Full scans and parsed indices still use O(N) metadata memory. Loading reuses one line buffer, save streams borrowed records, and CLI/RPC refresh comparison merges ordered borrowed records without cloning the saved snapshot or constructing extra path maps. Parsed metadata, candidate scan records and the longest input record still contribute to peak memory. Actual process-memory, latency and cross-platform performance budgets have not been validated.
 - `stats` avoids rescanning the filesystem root, but currently still loads and parses the entire saved index; it is not a constant-time metadata lookup.
 - Writer locking resolves existing index paths and canonical parents of new paths, including supported relative/absolute and parent-symlink aliases. Hard-link index aliases, older/noncooperating writers, network-filesystem guarantees, and hostile directories are unsupported. Keep index/state/endpoint files in a trusted user-controlled directory; a cooperative lock is not authorization.
 - New Unix lock/publication files request mode `0600`; Windows files inherit the destination directory ACL. No custom Windows ACL or preservation of an old file-specific ACL is promised. Atomic replacement/power-loss durability and concurrent-client behavior still need native Linux/macOS acceptance; current verification is Windows-only.

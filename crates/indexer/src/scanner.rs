@@ -64,19 +64,39 @@ impl Scanner {
     /// # Errors
     /// Returns an error when the root, index identity or an entry cannot be read.
     pub fn scan_for_index(&self, root: &Path, index_path: &Path) -> io::Result<Vec<IndexedFile>> {
+        self.scan_for_index_with_artifacts(root, index_path, &[])
+    }
+
+    /// Also excludes the exact resolved runtime files supplied by the owner.
+    ///
+    /// Missing artifacts are resolved without creating directories. Their names
+    /// do not exclude similarly named user files elsewhere in the scanned tree.
+    ///
+    /// # Errors
+    /// Returns an error for inaccessible roots/entries or invalid file identities.
+    pub fn scan_for_index_with_artifacts(
+        &self,
+        root: &Path,
+        index_path: &Path,
+        runtime_artifacts: &[PathBuf],
+    ) -> io::Result<Vec<IndexedFile>> {
         let root = fs::canonicalize(root)?;
         let index = resolve_index_path(index_path, false)?;
-        self.scan_with_artifacts(&root, Some(&index))
+        let runtime_artifacts = runtime_artifacts
+            .iter()
+            .map(|path| resolve_index_path(path, false))
+            .collect::<io::Result<BTreeSet<_>>>()?;
+        let artifacts = IndexArtifacts::new(&index, runtime_artifacts);
+        self.scan_with_artifacts(&root, Some(&artifacts))
     }
 
     fn scan_with_artifacts(
         &self,
         root: &Path,
-        index: Option<&Path>,
+        artifacts: Option<&IndexArtifacts>,
     ) -> io::Result<Vec<IndexedFile>> {
         let mut files = Vec::new();
-        let artifacts = index.map(IndexArtifacts::new);
-        self.scan_directory(root, root, artifacts.as_ref(), &mut files)?;
+        self.scan_directory(root, root, artifacts, &mut files)?;
 
         files.sort_by(|left, right| {
             left.relative_path
@@ -125,10 +145,11 @@ struct IndexArtifacts {
     index: PathBuf,
     lock: PathBuf,
     publication_prefix: std::ffi::OsString,
+    runtime_artifacts: BTreeSet<PathBuf>,
 }
 
 impl IndexArtifacts {
-    fn new(index: &Path) -> Self {
+    fn new(index: &Path, runtime_artifacts: BTreeSet<PathBuf>) -> Self {
         let lock = adjacent_lock_path(index);
         let lock =
             if fs::symlink_metadata(&lock).is_ok_and(|metadata| metadata.file_type().is_file()) {
@@ -140,11 +161,12 @@ impl IndexArtifacts {
             index: index.to_path_buf(),
             lock,
             publication_prefix: publication_prefix(index),
+            runtime_artifacts,
         }
     }
 
     fn excludes(&self, path: &Path) -> bool {
-        if path == self.index || path == self.lock {
+        if path == self.index || path == self.lock || self.runtime_artifacts.contains(path) {
             return true;
         }
         if path.parent() != self.index.parent() {

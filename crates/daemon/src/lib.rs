@@ -1,5 +1,8 @@
 pub mod service;
 
+#[cfg(test)]
+mod refresh_tests;
+
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -7,13 +10,14 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ai_file_search_indexer::{
-    FileIndexStore, FileIndexWriter, IndexWriterGuard, RefreshSummary, ScanOptions, Scanner,
+    FileIndexStore, FileIndexWriter, IndexWriterGuard, IndexedFile, RefreshSummary, ScanOptions,
+    Scanner,
 };
 use ai_file_search_protocol::{Request, Response};
 use serde_json::json;
 use service::{
-    DEFAULT_ENDPOINT, ServiceState, ServiceStatus, default_state_path, read_state, remove_state,
-    render_status_json, render_status_text, write_state,
+    DEFAULT_ENDPOINT, SERVICE_STATE_ENV, ServiceState, ServiceStatus, default_state_path,
+    read_state, remove_state, render_status_json, render_status_text, write_state,
 };
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::time::sleep;
@@ -266,11 +270,15 @@ async fn service_start(args: &[String], state_path: &Path) -> CliResult {
         guard.index_path().to_path_buf()
     };
 
-    let mut child =
-        match spawn_service_child(&index_path, &parsed.endpoint, parsed.auto_refresh_seconds) {
-            Ok(child) => child,
-            Err(result) => return result,
-        };
+    let mut child = match spawn_service_child(
+        &index_path,
+        &parsed.endpoint,
+        parsed.auto_refresh_seconds,
+        state_path,
+    ) {
+        Ok(child) => child,
+        Err(result) => return result,
+    };
 
     wait_for_started_service(
         &parsed.endpoint,
@@ -407,7 +415,23 @@ fn spawn_service_child(
     index_path: &Path,
     endpoint: &str,
     auto_refresh_seconds: Option<u64>,
+    state_path: &Path,
 ) -> Result<Child, CliResult> {
+    service_child_command(index_path, endpoint, auto_refresh_seconds, state_path)?
+        .spawn()
+        .map_err(|error| CliResult {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: format!("service spawn failed: {error}\n"),
+        })
+}
+
+fn service_child_command(
+    index_path: &Path,
+    endpoint: &str,
+    auto_refresh_seconds: Option<u64>,
+    state_path: &Path,
+) -> Result<Command, CliResult> {
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(error) => {
@@ -419,11 +443,17 @@ fn spawn_service_child(
         }
     };
 
+    let state_path = std::path::absolute(state_path).map_err(|error| CliResult {
+        exit_code: 1,
+        stdout: String::new(),
+        stderr: format!("service state path resolve failed: {error}\n"),
+    })?;
     let mut command = Command::new(exe);
     command
         .arg("service-run")
         .arg(index_path)
         .arg(endpoint)
+        .env(SERVICE_STATE_ENV, state_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -440,11 +470,7 @@ fn spawn_service_child(
         command.creation_flags(CREATE_NO_WINDOW);
     }
 
-    command.spawn().map_err(|error| CliResult {
-        exit_code: 1,
-        stdout: String::new(),
-        stderr: format!("service spawn failed: {error}\n"),
-    })
+    Ok(command)
 }
 
 async fn wait_for_started_service(
@@ -543,7 +569,14 @@ pub async fn service_run(
         eprint!("{}", result.stderr);
         return result.exit_code;
     }
-    match serve_ipc_with_guard(&mut guard, endpoint).await {
+    let state_path = match std::path::absolute(default_state_path()) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("service state path resolve failed: {error}");
+            return 1;
+        }
+    };
+    match serve_ipc_with_guard(&mut guard, endpoint, &[state_path]).await {
         Ok(()) => 0,
         Err(error) => {
             eprintln!("service run failed: {error}");
@@ -566,13 +599,14 @@ pub fn handle_json_line(index_path: &Path, line: &str) -> Response {
 
 #[must_use]
 pub fn handle_json_request(index_path: &Path, line: &str) -> HandlerOutcome {
-    handle_json_request_with_guard(index_path, line, None)
+    handle_json_request_with_guard(index_path, line, None, &[])
 }
 
 fn handle_json_request_with_guard(
     index_path: &Path,
     line: &str,
     guard: Option<&mut IndexWriterGuard>,
+    runtime_artifacts: &[PathBuf],
 ) -> HandlerOutcome {
     let request = match Request::from_json_line(line) {
         Ok(request) => request,
@@ -594,7 +628,7 @@ fn handle_json_request_with_guard(
             shutdown_requested: false,
         },
         "index_status" => HandlerOutcome {
-            response: index_status(index_path, &request),
+            response: index_status(index_path, &request, runtime_artifacts),
             shutdown_requested: false,
         },
         "shutdown" => HandlerOutcome {
@@ -606,7 +640,7 @@ fn handle_json_request_with_guard(
             shutdown_requested: false,
         },
         "refresh" | "reindex" => HandlerOutcome {
-            response: refresh(index_path, &request, guard),
+            response: refresh(index_path, &request, guard, runtime_artifacts),
             shutdown_requested: false,
         },
         "search" => HandlerOutcome {
@@ -676,7 +710,72 @@ fn method_catalog(id: u64) -> Response {
     )
 }
 
-fn index_status(index_path: &Path, request: &Request) -> Response {
+struct ScanComparison {
+    root: PathBuf,
+    files: Vec<IndexedFile>,
+    summary: RefreshSummary,
+}
+
+fn scan_index(
+    options: ScanOptions,
+    root: &Path,
+    index_path: &Path,
+    runtime_artifacts: &[PathBuf],
+) -> io::Result<Vec<IndexedFile>> {
+    Scanner::new(options).scan_for_index_with_artifacts(root, index_path, runtime_artifacts)
+}
+
+fn scan_and_compare(
+    store: &FileIndexStore,
+    index_path: &Path,
+    params: &serde_json::Value,
+    options: Option<ScanOptions>,
+    runtime_artifacts: &[PathBuf],
+    scan: impl FnOnce(ScanOptions, &Path, &Path, &[PathBuf]) -> io::Result<Vec<IndexedFile>>,
+) -> Result<ScanComparison, String> {
+    let root = index_root(store, params)?;
+    let options = store.resolve_scan_options(options)?;
+    let files = scan(options, &root, index_path, runtime_artifacts)
+        .map_err(|error| format!("scan failed: {error}"))?;
+    let summary = RefreshSummary::compare_ordered(store.iter_files(), &files);
+    Ok(ScanComparison {
+        root,
+        files,
+        summary,
+    })
+}
+
+fn publish_comparison<'guard>(
+    store: &mut FileIndexWriter<'guard>,
+    comparison: ScanComparison,
+    save_only_if_changed: bool,
+    save: impl FnOnce(&FileIndexWriter<'guard>) -> io::Result<()>,
+) -> Result<(usize, RefreshSummary), String> {
+    let ScanComparison {
+        root,
+        files,
+        summary,
+    } = comparison;
+    let scanned_files = files.len();
+    if !save_only_if_changed || summary.has_changes() {
+        store.set_root_path(&root);
+        store.replace_all(files);
+        save(store).map_err(|error| format!("index save failed: {error}"))?;
+    }
+    Ok((scanned_files, summary))
+}
+
+fn summary_result(scanned_files: usize, summary: &RefreshSummary) -> serde_json::Value {
+    json!({
+        "scanned_files": scanned_files,
+        "added": summary.added,
+        "updated": summary.updated,
+        "removed": summary.removed,
+        "unchanged": summary.unchanged,
+    })
+}
+
+fn index_status(index_path: &Path, request: &Request, runtime_artifacts: &[PathBuf]) -> Response {
     let options = match scan_options(&request.params) {
         Ok(options) => options,
         Err(message) => return Response::error(request.id, message),
@@ -692,38 +791,28 @@ fn index_status(index_path: &Path, request: &Request) -> Response {
     ) {
         return Response::error(request.id, "root must be a string");
     }
-    let root = match index_root(&store, &request.params) {
-        Ok(root) => root,
+    let comparison = match scan_and_compare(
+        &store,
+        index_path,
+        &request.params,
+        options,
+        runtime_artifacts,
+        scan_index,
+    ) {
+        Ok(comparison) => comparison,
         Err(message) => return Response::error(request.id, message),
     };
-
-    let options = match store.resolve_scan_options(options) {
-        Ok(options) => options,
-        Err(message) => return Response::error(request.id, message),
-    };
-
-    let files = match Scanner::new(options).scan_for_index(&root, index_path) {
-        Ok(files) => files,
-        Err(error) => return Response::error(request.id, format!("scan failed: {error}")),
-    };
-    let scanned_files = files.len();
-    let summary = RefreshSummary::compare(&store.all_files(), &files);
-    let needs_refresh = summary.added > 0 || summary.updated > 0 || summary.removed > 0;
-
-    Response::success(
-        request.id,
-        json!({
-            "scanned_files": scanned_files,
-            "added": summary.added,
-            "updated": summary.updated,
-            "removed": summary.removed,
-            "unchanged": summary.unchanged,
-            "needs_refresh": needs_refresh,
-        }),
-    )
+    let mut result = summary_result(comparison.files.len(), &comparison.summary);
+    result["needs_refresh"] = json!(comparison.summary.has_changes());
+    Response::success(request.id, result)
 }
 
-fn refresh(index_path: &Path, request: &Request, guard: Option<&mut IndexWriterGuard>) -> Response {
+fn refresh(
+    index_path: &Path,
+    request: &Request,
+    guard: Option<&mut IndexWriterGuard>,
+    runtime_artifacts: &[PathBuf],
+) -> Response {
     let options = match scan_options(&request.params) {
         Ok(options) => options,
         Err(message) => return Response::error(request.id, message),
@@ -749,40 +838,24 @@ fn refresh(index_path: &Path, request: &Request, guard: Option<&mut IndexWriterG
         Ok(store) => store,
         Err(error) => return Response::error(request.id, format!("index open failed: {error}")),
     };
-    let root = match index_root(&store, &request.params) {
-        Ok(root) => root,
+    let comparison = match scan_and_compare(
+        &store,
+        &index_path,
+        &request.params,
+        options,
+        runtime_artifacts,
+        scan_index,
+    ) {
+        Ok(comparison) => comparison,
         Err(message) => return Response::error(request.id, message),
     };
+    let (scanned_files, summary) =
+        match publish_comparison(&mut store, comparison, false, FileIndexWriter::save) {
+            Ok(result) => result,
+            Err(message) => return Response::error(request.id, message),
+        };
 
-    let options = match store.resolve_scan_options(options) {
-        Ok(options) => options,
-        Err(message) => return Response::error(request.id, message),
-    };
-
-    let files = match Scanner::new(options).scan_for_index(&root, &index_path) {
-        Ok(files) => files,
-        Err(error) => return Response::error(request.id, format!("scan failed: {error}")),
-    };
-    let scanned_files = files.len();
-
-    let old_files = store.all_files();
-    let summary = RefreshSummary::compare(&old_files, &files);
-    store.set_root_path(&root);
-    store.replace_all(files);
-    if let Err(error) = store.save() {
-        return Response::error(request.id, format!("index save failed: {error}"));
-    }
-
-    Response::success(
-        request.id,
-        json!({
-            "scanned_files": scanned_files,
-            "added": summary.added,
-            "updated": summary.updated,
-            "removed": summary.removed,
-            "unchanged": summary.unchanged,
-        }),
-    )
+    Response::success(request.id, summary_result(scanned_files, &summary))
 }
 
 fn index_root(store: &FileIndexStore, params: &serde_json::Value) -> Result<PathBuf, &'static str> {
@@ -885,13 +958,14 @@ pub async fn handle_json_stream<S>(index_path: &Path, stream: S) -> io::Result<S
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    handle_json_stream_with_guard(index_path, stream, None).await
+    handle_json_stream_with_guard(index_path, stream, None, &[]).await
 }
 
 async fn handle_json_stream_with_guard<S>(
     index_path: &Path,
     stream: S,
     mut guard: Option<&mut IndexWriterGuard>,
+    runtime_artifacts: &[PathBuf],
 ) -> io::Result<StreamStatus>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -906,7 +980,12 @@ where
             return Ok(StreamStatus::ClientDisconnected);
         }
 
-        let outcome = handle_json_request_with_guard(index_path, &line, guard.as_deref_mut());
+        let outcome = handle_json_request_with_guard(
+            index_path,
+            &line,
+            guard.as_deref_mut(),
+            runtime_artifacts,
+        );
         stream
             .get_mut()
             .write_all(outcome.response.to_json_line().as_bytes())
@@ -924,6 +1003,7 @@ async fn handle_one_json_request<S>(
     index_path: &Path,
     stream: S,
     guard: &mut IndexWriterGuard,
+    runtime_artifacts: &[PathBuf],
 ) -> io::Result<StreamStatus>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -934,7 +1014,7 @@ where
         return Ok(StreamStatus::ClientDisconnected);
     }
 
-    let outcome = handle_json_request_with_guard(index_path, &line, Some(guard));
+    let outcome = handle_json_request_with_guard(index_path, &line, Some(guard), runtime_artifacts);
     stream
         .get_mut()
         .write_all(outcome.response.to_json_line().as_bytes())
@@ -990,11 +1070,15 @@ fn pipe_name(endpoint: &str) -> String {
 /// created, or a client stream cannot be handled.
 pub async fn serve_ipc(index_path: &Path, endpoint: &str) -> io::Result<()> {
     let mut guard = IndexWriterGuard::acquire(index_path)?;
-    serve_ipc_with_guard(&mut guard, endpoint).await
+    serve_ipc_with_guard(&mut guard, endpoint, &[]).await
 }
 
 #[cfg(windows)]
-async fn serve_ipc_with_guard(guard: &mut IndexWriterGuard, endpoint: &str) -> io::Result<()> {
+async fn serve_ipc_with_guard(
+    guard: &mut IndexWriterGuard,
+    endpoint: &str,
+    runtime_artifacts: &[PathBuf],
+) -> io::Result<()> {
     use tokio::net::windows::named_pipe::ServerOptions;
 
     let index_path = guard.index_path().to_path_buf();
@@ -1002,7 +1086,7 @@ async fn serve_ipc_with_guard(guard: &mut IndexWriterGuard, endpoint: &str) -> i
     loop {
         let server = ServerOptions::new().create(&endpoint)?;
         server.connect().await?;
-        let status = handle_one_json_request(&index_path, server, guard).await?;
+        let status = handle_one_json_request(&index_path, server, guard, runtime_artifacts).await?;
         if status == StreamStatus::ShutdownRequested {
             return Ok(());
         }
@@ -1023,7 +1107,11 @@ pub async fn send_ipc_request(endpoint: &str, request: &str) -> io::Result<Strin
 }
 
 #[cfg(unix)]
-async fn serve_ipc_with_guard(guard: &mut IndexWriterGuard, endpoint: &str) -> io::Result<()> {
+async fn serve_ipc_with_guard(
+    guard: &mut IndexWriterGuard,
+    endpoint: &str,
+    runtime_artifacts: &[PathBuf],
+) -> io::Result<()> {
     use tokio::net::UnixListener;
 
     let index_path = guard.index_path().to_path_buf();
@@ -1031,7 +1119,9 @@ async fn serve_ipc_with_guard(guard: &mut IndexWriterGuard, endpoint: &str) -> i
     let listener = UnixListener::bind(endpoint)?;
     loop {
         let (stream, _) = listener.accept().await?;
-        let status = handle_json_stream_with_guard(&index_path, stream, Some(guard)).await?;
+        let status =
+            handle_json_stream_with_guard(&index_path, stream, Some(guard), runtime_artifacts)
+                .await?;
         if status == StreamStatus::ShutdownRequested {
             return Ok(());
         }

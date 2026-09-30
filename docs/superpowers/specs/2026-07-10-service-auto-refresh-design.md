@@ -4,7 +4,7 @@ Reviewed: 2026-09-30. This revision supersedes the original timer, storage, and 
 
 ## Implementation Status
 
-Implemented: interval parsing, child argument forwarding, startup-state rendering, scan-policy persistence, manual policy inheritance/mismatch rejection, explicit rebuilds, configured-start root/policy validation, cross-process writer ownership, and unique streaming snapshot publication. The current `service_run` uses the interval only for prerequisite validation, then calls the existing IPC server without scheduling scans. Scheduled refresh, bounded service connections, and the runtime status below are NOT implemented. Native Windows verification is separate from pending Linux/macOS and performance acceptance.
+Implemented: interval parsing, child argument forwarding, startup-state rendering, scan-policy persistence, manual policy inheritance/mismatch rejection, explicit rebuilds, configured-start root/policy validation, cross-process writer ownership, unique streaming snapshot publication/loading, borrowed ordered comparison, a shared scan/publication operation, and managed-state path forwarding/self-exclusion. The current `service_run` uses the interval only for prerequisite validation, then calls the existing IPC server without scheduling scans. Conditional publication is a tested common operation, not an active timer. Scheduled refresh, bounded service connections, and the runtime status below are NOT implemented. Native Windows verification is separate from pending Linux/macOS and performance acceptance.
 
 The configuration flag is not evidence that an automatic scan has run. Do not document this as an active feature until the implementation and platform acceptance gates pass.
 
@@ -89,7 +89,7 @@ Snapshot publication must:
 
 A fixed `<index>.tmp` is unacceptable: it permits write races and can follow a pre-existing link. Exclusive creation prevents that particular path-reuse problem; it is not a substitute for a private directory or writer isolation.
 
-Publication uses `.<index-filename>.aifs-tmp-<pid>-<counter>` with bounded exclusive-creation retries. Existing collisions/links and legacy `<index>.tmp` files are untouched. Owned temporaries are removed on ordinary pre-publication failure; process termination can leave a reserved artifact. `Scanner::scan_for_index` centrally excludes the resolved index, adjacent lock and same-directory reserved prefix without per-entry canonicalization or a blanket `.tmp` filter. Service-state self-exclusion is still part of Task 4/5, not this storage slice.
+Publication uses `.<index-filename>.aifs-tmp-<pid>-<counter>` with bounded exclusive-creation retries. Existing collisions/links and legacy `<index>.tmp` files are untouched. Owned temporaries are removed on ordinary pre-publication failure; process termination can leave a reserved artifact. `Scanner::scan_for_index` centrally excludes the resolved index, adjacent lock and same-directory reserved prefix without per-entry canonicalization or a blanket `.tmp` filter. `scan_for_index_with_artifacts` also excludes explicit runtime file identities resolved once per scan, without creating missing directories. Managed service supplies its actual state path; direct/stdio/manual IPC does not infer that context.
 
 Relative/absolute paths and resolvable parent aliases share ownership. An existing final symlink resolves to its target, and the writer publishes to that target. Path locks do not unify different hard-link names. Lock-path symlinks/nonregular types are rejected; protection against hostile directory replacement, writers ignoring locks and network-filesystem semantics is outside this contract. Existing readers may finish using the old snapshot while newly opened readers see the replacement on supported local filesystems.
 
@@ -129,17 +129,19 @@ The scan itself remains synchronous and serial. Wrapping it in `tokio::time::tim
 
 ## Refresh Operation And Memory Budget
 
-Share one private scan/compare operation with manual refresh and read-only index status, preserving their existing summary fields and root error messages.
+Share one private scan/compare operation with manual refresh and read-only index status, preserving their existing summary fields and root error messages. It borrows the actual read-only snapshot (including a writer's immutable dereference), returning the resolved root, candidate records and summary without cloning the saved records. Mutation still requires the held writer guard.
 
 - Open `FileIndexStore`, resolve scope, and scan exactly once.
-- Compare saved and candidate metadata (`size_bytes` and second-resolution modification time); same-size edits within that timestamp resolution may be missed. Do not claim content-change detection.
+- Compare saved and candidate metadata (`size_bytes` and second-resolution modification time); same-size edits within that timestamp resolution may be missed. Do not claim content-change detection. `iter_files` yields borrowed normalized-path order and `RefreshSummary::compare_ordered` performs one merge with constant extra space. Inputs must be nondecreasing by normalized path; adjacent duplicate paths retain their final record, matching the legacy map comparison.
 - On an automatic attempt with zero added/updated/removed counts, do not save or touch index modification time.
 - On change, apply `replace_all` and the failure-safe `save()` contract while preserving root and policy.
 - `index_status` never calls mutation or save, and no polling call precedes an automatic scan.
 
-Current implementation costs include the parsed `BTreeMap`, cloned `all_files()` results, candidate `Vec`, two comparison maps, and whole-file text loading. Save now streams borrowed records instead of collecting cloned records and a whole-file formatting buffer. Serial execution does NOT remove the remaining copies.
+Manual refresh keeps explicit publication even when file metadata is unchanged. A shared publication helper's conditional mode is tested with scan/write spies before scheduler integration: one scan and one save on change, one scan and no save on unchanged metadata. This does not enable an automatic timer or introduce a new RPC method.
 
-Before claiming memory-conscious scheduled refresh, introduce borrowed ordered iteration, compare sorted entries without additional path maps/cloned snapshots, and stream load/save rather than buffering complete text files. Retain the old snapshot and candidate metadata required for correctness: scan peak remains O(N), while unchanged idle state has no loaded scan snapshot or watcher. Do not retain capacities of full scan buffers after returning to idle without measuring retained memory.
+The refresh/status path now keeps the parsed `BTreeMap` and candidate `Vec`, with one longest-line read buffer during loading. Borrowed ordered comparison removes the cloned `all_files()` snapshot and two auxiliary path maps; stream loading removes the full input text buffer, and stream save avoids a whole-file formatting buffer. Legacy `all_files()` and `RefreshSummary::compare` APIs remain available for compatibility but are not used by these production comparison paths. Search result allocation and broader performance optimization are separate from this slice.
+
+Before claiming memory-conscious scheduled refresh, introduce borrowed ordered iteration, compare sorted entries without additional path maps/cloned snapshots, and stream load/save rather than buffering complete text files. Stream loading reuses one line buffer while building the saved metadata map; its maximum record buffer, the parsed map and the candidate vector still contribute to memory. Retain the old snapshot and candidate metadata required for correctness: scan peak remains O(N), while unchanged idle state has no loaded scan snapshot or watcher. Do not retain capacities of full scan buffers after returning to idle without measuring retained memory. These structural reductions are not a measured process-memory budget or Everything-scale performance acceptance.
 
 ## Failure And Observability
 

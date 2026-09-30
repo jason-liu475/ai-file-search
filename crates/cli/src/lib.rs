@@ -387,8 +387,7 @@ fn status(
         }
     };
     let file_count = files.len();
-    let old_files = store.all_files();
-    let summary = RefreshSummary::compare(&old_files, &files);
+    let summary = RefreshSummary::compare_ordered(store.iter_files(), files.iter());
 
     let stdout = match output_format {
         OutputFormat::Text => format_summary("scanned", file_count, &summary),
@@ -456,8 +455,7 @@ fn refresh(root: &str, index_path: &str, requested_options: Option<ScanOptions>)
         }
     };
     let file_count = files.len();
-    let old_files = store.all_files();
-    let summary = RefreshSummary::compare(&old_files, &files);
+    let summary = RefreshSummary::compare_ordered(store.iter_files(), files.iter());
     store.set_root_path(&root);
     store.replace_all(files);
     if let Err(error) = store.save() {

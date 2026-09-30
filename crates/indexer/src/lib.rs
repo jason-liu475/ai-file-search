@@ -1,3 +1,4 @@
+mod comparison;
 mod scanner;
 mod store;
 mod writer_lock;

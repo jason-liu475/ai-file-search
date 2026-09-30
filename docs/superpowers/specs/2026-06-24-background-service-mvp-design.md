@@ -1,6 +1,6 @@
 # Background Service MVP Design
 
-Reviewed: 2026-09-30. The managed-process MVP is implemented. The ownership, bounded-health-I/O, private-endpoint, atomic-state, and error-state corrections below are revised contracts, not claims that the current code already enforces them. They are prerequisites for unattended automatic refresh.
+Reviewed: 2026-09-30. The managed-process MVP and Task 5a ownership, bounded-health-I/O, atomic-state and error-status safeguards are implemented with Windows verification. Private endpoint ACL/runtime-directory checks, stale Unix endpoint recovery and native Linux/macOS acceptance remain Task 5b; those contracts below are not yet completed. They are prerequisites for unattended automatic refresh.
 
 ## Goal
 
@@ -69,7 +69,7 @@ Behavior:
 1. Resolve `index-file` to an absolute path.
 2. Resolve the exact state path, including `AIFS_SERVICE_STATE`, and the endpoint into a private per-user namespace. The prototype default remains `aifs-service`; the hardened Unix default must be an absolute path under a private runtime directory, and Windows needs first-instance protection and current-user access restrictions.
 3. Hold a short-lived startup coordination guard; inspect child-lifetime ownership separately. This lets the child acquire its lifetime guard before the parent publishes state and releases startup coordination, with no unowned handoff window.
-4. If state exists and `ping` succeeds, verify that the requested index/endpoint matches before reporting an already-running instance. Report that configuration is retained rather than pretending a new interval took effect.
+4. If state exists and structured `ping` identity matches active instance ownership, verify that the requested index/endpoint/interval matches before reporting already running. A mismatch fails and requires stop/start rather than pretending a new configuration took effect.
 5. A failed or timed-out `ping` is unknown/busy, not proof of stale state. If startup or child-lifetime ownership is held, do not replace state, unlink the endpoint, or spawn a duplicate. Malformed state is an explicit error.
 6. Spawn `service-run` as a background child, retaining its `Child` handle. The child acquires managed-instance and index-writer ownership before binding. Pass absolute index/state paths and optional configuration explicitly.
 7. Poll readiness with bounded I/O. On readiness failure, stop and reap only the child spawned by this attempt; do not use an advisory saved PID as kill authority.
@@ -114,7 +114,7 @@ Exit codes:
 - `1` for `starting`, `unresponsive`, `stale`, or unreadable/malformed state
 - `2` for usage errors
 
-The revised machine-readable status names are exactly `running`, `stopped`, `starting`, `unresponsive`, `stale`, and `error`. Error output carries a concise reason; do not invent a separate `busy` status or require metadata fields when no readable state exists. Existing healthy/stopped JSON stays unchanged.
+The machine-readable status names are exactly `running`, `stopped`, `starting`, `unresponsive`, `stale`, and `error`. Error output carries a concise reason; do not invent a separate `busy` status or require metadata fields when no readable state exists. Existing healthy/stopped JSON stays unchanged.
 
 ### `service stop`
 
@@ -189,6 +189,10 @@ State schema:
 The state file and PID are advisory. A successful `ping` proves an endpoint responded, not ownership of the intended index; a failed `ping` does not prove process death. Reconcile bounded health checks with managed-instance/index guards and matching identity before startup, cleanup, or stop decisions.
 
 Write state atomically, do not rewrite it per automatic scan, and pass the resolved absolute state path to the child for artifact self-exclusion. Configuration-only state is not evidence that scheduled refresh has run.
+
+Task 5a implements atomic state with a 64 KiB serialized/read limit, same-directory `.<filename>.aifs-tmp-<pid>-<time>-<sequence>.tmp` exclusive creation, flush/sync/close before replacement, bounded collision retries and cleanup of only the current temporary. `<filename>.startup.lock` and `<filename>.instance.lock` remain after release and are excluded from managed scans along with their adjacent reserved publication namespaces. Never unlink a lock to recover ownership. State and locks still require a trusted user-controlled parent; cooperative locks and identity responses are not caller authorization.
+
+New managed state also stores an optional child-generated `instance_id`; older JSON defaults it to `None` and remains readable. Readiness persists the child's start timestamp/generation rather than inventing one in the parent. Structured managed ping and targeted shutdown include both fields, preventing an earlier instance target from matching on a reused PID/configuration alone. The generation is not a secret credential, and existing running/stopped status rendering stays unchanged. Legacy state cannot claim an upgraded managed instance solely by PID.
 
 ## Internal Components
 
@@ -289,7 +293,7 @@ This MVP exposes local-only IPC, not HTTP. The service endpoint is intended for 
 
 Security-sensitive follow-ups:
 
-- Restrict Named Pipe and Unix Socket permissions before production or unattended use; use private per-user directories/namespaces and first-instance protection.
+- Restrict Named Pipe and Unix Socket permissions before production or unattended use; use private per-user directories/namespaces. Task 5a implements Windows first-instance and remote-client rejection but no custom current-user ACL, and Unix socket mode `0600` but no validated private runtime directory.
 - Never unlink a pre-existing endpoint without verified ownership, socket-type inspection, and safe stale detection.
 - Add an optional per-user token or peer-credential check.
 - Define a separate safe read-only API profile for AI clients.

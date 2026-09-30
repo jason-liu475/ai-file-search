@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -45,6 +45,8 @@ async fn check_managed_artifacts(relative_state: bool) {
         .unwrap();
     assert!(start.success(), "{}", fs::read_to_string(&stderr).unwrap());
     assert!(fixture.root.join("owned.runtime").is_file());
+    let state_temporary = fixture.root.join(".owned.runtime.aifs-tmp-abandoned.tmp");
+    fs::write(&state_temporary, "reserved service temporary").unwrap();
     let before = fs::read(&fixture.index).unwrap();
     assert_eq!(
         rpc(&fixture.endpoint, "stats", json!({})).await,
@@ -89,21 +91,7 @@ async fn check_managed_artifacts(relative_state: bool) {
         summary(0, 5)
     );
     let store = FileIndexStore::open(&fixture.index).unwrap();
-    assert_eq!(store.file_count(), 5);
-    assert_eq!(store.total_size_bytes(), 21);
-    assert_eq!(store.search_by_name("owned.runtime").len(), 1);
-    assert_eq!(
-        store.search_by_name("owned.runtime")[0]
-            .relative_path
-            .as_normalized(),
-        "elsewhere/owned.runtime"
-    );
-    assert_eq!(store.search_by_name("ordinary.tmp").len(), 1);
-    assert_eq!(store.search_by_name("secret").len(), 0);
-    assert_eq!(
-        store.scan_policy(),
-        Some(&ScanOptions::default().exclude_name("target"))
-    );
+    assert_saved_scope(&store, &state_temporary);
     assert_eq!(
         rpc(
             &fixture.endpoint,
@@ -118,6 +106,29 @@ async fn check_managed_artifacts(relative_state: bool) {
     );
     service.stop();
     assert!(IndexWriterGuard::acquire(&fixture.index).is_ok());
+}
+
+fn assert_saved_scope(store: &FileIndexStore, state_temporary: &Path) {
+    assert_eq!(store.file_count(), 5);
+    assert_eq!(store.total_size_bytes(), 21);
+    assert_eq!(store.search_by_name("owned.runtime").len(), 1);
+    assert_eq!(
+        store.search_by_name("owned.runtime")[0]
+            .relative_path
+            .as_normalized(),
+        "elsewhere/owned.runtime"
+    );
+    assert_eq!(store.search_by_name("ordinary.tmp").len(), 1);
+    assert!(store.search_by_name("aifs-tmp").is_empty());
+    assert_eq!(
+        fs::read_to_string(state_temporary).unwrap(),
+        "reserved service temporary"
+    );
+    assert_eq!(store.search_by_name("secret").len(), 0);
+    assert_eq!(
+        store.scan_policy(),
+        Some(&ScanOptions::default().exclude_name("target"))
+    );
 }
 
 #[test]

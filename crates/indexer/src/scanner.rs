@@ -67,10 +67,11 @@ impl Scanner {
         self.scan_for_index_with_artifacts(root, index_path, &[])
     }
 
-    /// Also excludes the exact resolved runtime files supplied by the owner.
+    /// Also excludes resolved runtime files and their adjacent publication namespace.
     ///
     /// Missing artifacts are resolved without creating directories. Their names
     /// do not exclude similarly named user files elsewhere in the scanned tree.
+    /// Each runtime file reserves only its adjacent `.<filename>.aifs-tmp-*` names.
     ///
     /// # Errors
     /// Returns an error for inaccessible roots/entries or invalid file identities.
@@ -146,6 +147,7 @@ struct IndexArtifacts {
     lock: PathBuf,
     publication_prefix: std::ffi::OsString,
     runtime_artifacts: BTreeSet<PathBuf>,
+    runtime_publications: Vec<(PathBuf, std::ffi::OsString)>,
 }
 
 impl IndexArtifacts {
@@ -157,11 +159,16 @@ impl IndexArtifacts {
             } else {
                 lock
             };
+        let runtime_publications = runtime_artifacts
+            .iter()
+            .map(|artifact| (artifact.clone(), publication_prefix(artifact)))
+            .collect();
         Self {
             index: index.to_path_buf(),
             lock,
             publication_prefix: publication_prefix(index),
             runtime_artifacts,
+            runtime_publications,
         }
     }
 
@@ -169,23 +176,31 @@ impl IndexArtifacts {
         if path == self.index || path == self.lock || self.runtime_artifacts.contains(path) {
             return true;
         }
-        if path.parent() != self.index.parent() {
-            return false;
-        }
-        let Some(name) = path.file_name() else {
-            return false;
-        };
-        let name = name.as_encoded_bytes();
-        let prefix = self.publication_prefix.as_encoded_bytes();
-        #[cfg(windows)]
-        {
-            name.get(..prefix.len())
-                .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
-        }
-        #[cfg(not(windows))]
-        {
-            name.starts_with(prefix)
-        }
+        matches_publication_namespace(path, &self.index, &self.publication_prefix)
+            || self
+                .runtime_publications
+                .iter()
+                .any(|(artifact, prefix)| matches_publication_namespace(path, artifact, prefix))
+    }
+}
+
+fn matches_publication_namespace(path: &Path, artifact: &Path, prefix: &std::ffi::OsStr) -> bool {
+    if path.parent() != artifact.parent() {
+        return false;
+    }
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    let name = name.as_encoded_bytes();
+    let prefix = prefix.as_encoded_bytes();
+    #[cfg(windows)]
+    {
+        name.get(..prefix.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+    }
+    #[cfg(not(windows))]
+    {
+        name.starts_with(prefix)
     }
 }
 

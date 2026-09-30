@@ -43,6 +43,7 @@ fn service_status_json_reports_stale_when_state_endpoint_is_unreachable() {
             index_path: fixture.path().join("index.txt"),
             started_unix_seconds: 1_782_281_286,
             auto_refresh_seconds: None,
+            instance_id: None,
         },
     )
     .expect("state should write");
@@ -295,6 +296,7 @@ async fn hidden_service_run_accepts_auto_refresh_seconds_and_serves_shutdown() {
     let endpoint = service_run_endpoint(&fixture);
     let mut child = ChildGuard::spawn(
         Command::new(daemon_binary())
+            .env(SERVICE_STATE_ENV, fixture.path().join("service-state.json"))
             .arg("service-run")
             .arg(&index_path)
             .arg(&endpoint)
@@ -596,6 +598,7 @@ async fn service_scan_policy_hidden_no_auto_keeps_legacy_behavior() {
     let endpoint = service_run_endpoint(&fixture);
     let mut child = ChildGuard::spawn(
         Command::new(daemon_binary())
+            .env(SERVICE_STATE_ENV, fixture.path().join("service-state.json"))
             .arg("service-run")
             .arg(&index_path)
             .arg(&endpoint)

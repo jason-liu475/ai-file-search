@@ -97,6 +97,54 @@ fn a_directory_is_not_a_valid_runtime_file_exclusion() {
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
 }
 
+#[test]
+fn runtime_publication_namespace_is_reserved_only_beside_the_exact_artifact() {
+    let fixture = TestDir::new("runtime-temporaries");
+    fixture.write("state.json", "runtime");
+    fixture.write(".state.json.aifs-tmp-abandoned.tmp", "runtime temporary");
+    fixture.write("elsewhere/.state.json.aifs-tmp-user.tmp", "user");
+    fixture.write("state.json.foreign.tmp", "user");
+    fixture.write("ordinary.tmp", "user");
+    let scanner = Scanner::new(ScanOptions::default());
+    let files = scanner
+        .scan_for_index_with_artifacts(
+            &fixture.path,
+            &fixture.path.join("index.txt"),
+            &[fixture.path.join("state.json")],
+        )
+        .unwrap();
+    assert_eq!(
+        files
+            .iter()
+            .map(|file| file.relative_path.as_normalized())
+            .collect::<Vec<_>>(),
+        [
+            "elsewhere/.state.json.aifs-tmp-user.tmp",
+            "ordinary.tmp",
+            "state.json.foreign.tmp",
+        ]
+    );
+    assert_eq!(
+        scanner
+            .scan_for_index(&fixture.path, &fixture.path.join("index.txt"))
+            .unwrap()
+            .len(),
+        5
+    );
+    fs::remove_file(fixture.path.join("state.json")).unwrap();
+    assert_eq!(
+        scanner
+            .scan_for_index_with_artifacts(
+                &fixture.path,
+                &fixture.path.join("index.txt"),
+                &[fixture.path.join("state.json")]
+            )
+            .unwrap()
+            .len(),
+        3
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn resolves_runtime_file_and_parent_symlink_aliases_without_following_scan_links() {

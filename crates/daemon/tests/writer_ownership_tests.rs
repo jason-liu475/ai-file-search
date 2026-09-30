@@ -22,6 +22,8 @@ async fn managed_service_owns_index_and_reuses_guard_for_refresh() {
     let endpoint = fixture.endpoint("owner");
     let mut owner = fixture.spawn_server("service-run", &endpoint);
     wait_ready(&endpoint).await;
+    let identity: serde_json::Value =
+        serde_json::from_str(&request(&endpoint, PING).await).unwrap();
 
     assert_writer_busy(&fixture.index);
     let before = fs::read(&fixture.index).unwrap();
@@ -29,15 +31,23 @@ async fn managed_service_owns_index_and_reuses_guard_for_refresh() {
     assert_standalone_writes_busy(&fixture, &before).await;
     assert_readers_work(&fixture, &endpoint).await;
 
-    let same_state = fixture.path.join("same-state.json");
+    let same_state = fixture.path.join("service-state.json");
     write_state(
         &same_state,
         &ServiceState {
             endpoint: endpoint.clone(),
             pid: owner.0.id(),
-            index_path: fixture.index.clone(),
-            started_unix_seconds: 1,
+            index_path: fs::canonicalize(&fixture.index).unwrap(),
+            started_unix_seconds: identity["result"]["service"]["started_unix_seconds"]
+                .as_u64()
+                .unwrap(),
             auto_refresh_seconds: None,
+            instance_id: Some(
+                identity["result"]["service"]["instance_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            ),
         },
     )
     .unwrap();
@@ -46,6 +56,7 @@ async fn managed_service_owns_index_and_reuses_guard_for_refresh() {
         .env(SERVICE_STATE_ENV, &same_state)
         .args(["service", "start"])
         .arg(&fixture.index)
+        .args(["--endpoint", &endpoint])
         .output()
         .unwrap();
     assert!(already_running.status.success());
@@ -73,18 +84,7 @@ async fn managed_service_owns_index_and_reuses_guard_for_refresh() {
     assert!(store.search_by_name("index.txt").is_empty());
     assert_eq!(fs::read(&reserved).unwrap(), b"reserved");
 
-    let state_path = fixture.path.join("owner-state.json");
-    write_state(
-        &state_path,
-        &ServiceState {
-            endpoint: endpoint.clone(),
-            pid: owner.0.id(),
-            index_path: fixture.index.clone(),
-            started_unix_seconds: 1,
-            auto_refresh_seconds: None,
-        },
-    )
-    .unwrap();
+    let state_path = same_state;
     let stop = fixture
         .command()
         .env(SERVICE_STATE_ENV, &state_path)
@@ -145,7 +145,7 @@ async fn assert_other_services_busy(fixture: &Fixture) {
 }
 
 #[tokio::test]
-async fn failed_start_state_write_reaps_owned_service_child() {
+async fn invalid_state_destination_is_rejected_before_spawning_service() {
     let fixture = Fixture::new("failed-state-write");
     let endpoint = fixture.endpoint("failed-start");
     let state_path = fixture.path.join("state-is-directory");
@@ -160,7 +160,7 @@ async fn failed_start_state_write_reaps_owned_service_child() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("service state write failed"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("service state read failed"));
     assert_closed(&endpoint).await;
     assert_writer_free(&fixture.index);
     assert!(
@@ -487,6 +487,7 @@ impl Fixture {
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_ai-file-search-daemon"));
         command.current_dir(&self.path);
+        command.env(SERVICE_STATE_ENV, self.path.join("service-state.json"));
         command
     }
     fn spawn_server(&self, mode: &str, endpoint: &str) -> OwnedChild {

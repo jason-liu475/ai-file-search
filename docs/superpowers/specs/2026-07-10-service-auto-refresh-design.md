@@ -4,7 +4,7 @@ Reviewed: 2026-09-30. This revision supersedes the original timer, storage, and 
 
 ## Implementation Status
 
-Implemented: interval parsing, child argument forwarding, startup-state rendering, scan-policy persistence, manual policy inheritance/mismatch rejection, explicit rebuilds, configured-start root/policy validation, cross-process writer ownership, unique streaming snapshot publication/loading, borrowed ordered comparison, a shared scan/publication operation, and managed-state path forwarding/self-exclusion. The current `service_run` uses the interval only for prerequisite validation, then calls the existing IPC server without scheduling scans. Conditional publication is a tested common operation, not an active timer. Scheduled refresh, bounded service connections, and the runtime status below are NOT implemented. Native Windows verification is separate from pending Linux/macOS and performance acceptance.
+Implemented: interval parsing, child argument forwarding, startup-state rendering, scan-policy persistence, manual policy inheritance/mismatch rejection, explicit rebuilds, configured-start root/policy validation, cross-process writer ownership, unique streaming snapshot publication/loading, borrowed ordered comparison, a shared scan/publication operation, and managed-state path forwarding/self-exclusion. Task 5a adds bounded single-request managed connections, bounded health/shutdown clients, startup/instance locks, structured service identity, atomic capped state publication and explicit lifecycle statuses. The current `service_run` still uses the interval only for prerequisite validation, without scheduling scans. Conditional publication is a tested common operation, not an active timer. Scheduled refresh and `refresh_status` below are NOT implemented. Task 5b private-endpoint access control/stale recovery and native Linux/macOS/performance acceptance remain open.
 
 The configuration flag is not evidence that an automatic scan has run. Do not document this as an active feature until the implementation and platform acceptance gates pass.
 
@@ -19,7 +19,7 @@ ai-file-search-daemon service-run <index-file> <endpoint> [--auto-refresh-second
 
 - Disabled by default; accept decimal integers in `30..=86400`.
 - Duplicate, unknown, missing, nonnumeric, and out-of-range flags return usage exit code `2`.
-- Starting an already-running instance retains its current configuration.
+- Starting an already-running instance requires matching index, endpoint and interval; mismatches fail and require stop/start.
 - Changing configuration requires a stop/start.
 - Legacy service-state JSON omitting `auto_refresh_seconds` loads as `None`.
 - JSON status includes the configured interval only for `Some`; text appends `auto refresh: <seconds>s`.
@@ -89,7 +89,7 @@ Snapshot publication must:
 
 A fixed `<index>.tmp` is unacceptable: it permits write races and can follow a pre-existing link. Exclusive creation prevents that particular path-reuse problem; it is not a substitute for a private directory or writer isolation.
 
-Publication uses `.<index-filename>.aifs-tmp-<pid>-<counter>` with bounded exclusive-creation retries. Existing collisions/links and legacy `<index>.tmp` files are untouched. Owned temporaries are removed on ordinary pre-publication failure; process termination can leave a reserved artifact. `Scanner::scan_for_index` centrally excludes the resolved index, adjacent lock and same-directory reserved prefix without per-entry canonicalization or a blanket `.tmp` filter. `scan_for_index_with_artifacts` also excludes explicit runtime file identities resolved once per scan, without creating missing directories. Managed service supplies its actual state path; direct/stdio/manual IPC does not infer that context.
+Publication uses `.<index-filename>.aifs-tmp-<pid>-<counter>` with bounded exclusive-creation retries. Existing collisions/links and legacy `<index>.tmp` files are untouched. Owned temporaries are removed on ordinary pre-publication failure; process termination can leave a reserved artifact. `Scanner::scan_for_index` centrally excludes the resolved index, adjacent lock and same-directory reserved prefix without per-entry canonicalization or a blanket `.tmp` filter. `scan_for_index_with_artifacts` also excludes explicit runtime file identities and their adjacent `.<filename>.aifs-tmp-*` namespaces, resolved once per scan without creating missing directories. Managed service supplies its actual state path and startup/instance locks; atomic state temporaries use the same reserved naming convention. Direct/stdio/manual IPC does not infer that context.
 
 Relative/absolute paths and resolvable parent aliases share ownership. An existing final symlink resolves to its target, and the writer publishes to that target. Path locks do not unify different hard-link names. Lock-path symlinks/nonregular types are rejected; protection against hostile directory replacement, writers ignoring locks and network-filesystem semantics is outside this contract. Existing readers may finish using the old snapshot while newly opened readers see the replacement on supported local filesystems.
 
@@ -125,6 +125,8 @@ For the MANAGED service on both platforms:
 - Keep stdio's existing multi-request stream semantics. Keep manually started `ipc` compatibility separate; do not pretend its old unbounded Unix stream handler meets the managed scheduler contract.
 - Bound CLI health/shutdown request I/O too. Timeout means unreachable or busy, not proof of process death.
 
+Task 5a implements these connection rules for both managed platform loops; only Windows is natively verified here. Frames use 8 KiB block reads with a capped accumulation buffer, not one syscall per byte. Service-management requests share a 5-second connect/write/read deadline, a 64 KiB outgoing request cap and a separate 1 MiB incoming response cap. Startup readiness shares a 2-second deadline and must match the owned child PID, index, endpoint and interval while instance ownership is held; it publishes the child's immutable startup timestamp and generation identifier. Health and targeted shutdown compare that persisted identity, including `instance_id`, so PID reuse alone cannot match a previous target. The identifier is correlation, not authentication. Windows keeps the next unconnected pipe alive during handling/scanning; Unix retains its listener. Transient accept/early-disconnect errors are retried without dropping the listener. Future timer integration must preserve the same pending transport state.
+
 The scan itself remains synchronous and serial. Wrapping it in `tokio::time::timeout` does not enforce a deadline on non-yielding work; see [Tokio timeout](https://docs.rs/tokio/latest/tokio/time/fn.timeout.html). Frame limits bound transport buffering, not all search response allocations.
 
 ## Refresh Operation And Memory Budget
@@ -158,6 +160,8 @@ Before claiming memory-conscious scheduled refresh, introduce borrowed ordered i
 The revised [background service design](2026-06-24-background-service-mvp-design.md) defines instance ownership and endpoint cleanup.
 
 Before enabling unattended refresh, bound health I/O and prevent stale-state recovery from spawning over a live/busy owner or unlinking its endpoint. Use a private user endpoint namespace and first-instance protection. Local IPC is not authentication; broader AI-tool access requires an explicit read-only authorization profile and OS peer/ACL restrictions before production use.
+
+Task 5a uses separate persistent state-adjacent startup and child-lifetime locks. A busy or unverifiable owner is `starting`/`unresponsive`, not permission to spawn or clean up. Invalid state is `error`. Stop verifies structured identity, optionally targets shutdown to that identity, and waits for lifetime/index release before removing matching advisory state. Atomic state writes are capped at 64 KiB including newline, use unique exclusive temporaries, and retain the owned startup `Child` for failure cleanup; no saved PID is kill authority. Windows first-instance/remote-rejection is implemented, not a current-user ACL. Unix binds without deleting any existing path and only removes the socket it created; native validation, private runtime directories and stale-socket recovery remain Task 5b. Do not enable the scheduler before those gates.
 
 ## Acceptance Gates
 

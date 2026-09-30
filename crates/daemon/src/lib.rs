@@ -1,5 +1,8 @@
+mod bounded_io;
 pub mod service;
 
+#[cfg(test)]
+mod managed_lifecycle_tests;
 #[cfg(test)]
 mod refresh_tests;
 
@@ -16,16 +19,16 @@ use ai_file_search_indexer::{
 use ai_file_search_protocol::{Request, Response};
 use serde_json::json;
 use service::{
-    DEFAULT_ENDPOINT, SERVICE_STATE_ENV, ServiceState, ServiceStatus, default_state_path,
-    read_state, remove_state, render_status_json, render_status_text, write_state,
+    DEFAULT_ENDPOINT, SERVICE_STATE_ENV, ServiceCoordination, ServiceInstanceGuard, ServiceState,
+    ServiceStatus, default_state_path, read_state, remove_state_if_matches, render_status_json,
+    render_status_text, write_state,
 };
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep, timeout, timeout_at};
 
 const USAGE: &str = "usage: ai-file-search-daemon <stdio <index-file>|handle <index-file> <json-line>|ipc <index-file> <endpoint>|ipc-request <endpoint> [json-line]|service start <index-file> [--endpoint <name>] [--auto-refresh-seconds <seconds>]|service status [--json]|service stop>\n";
 const MIN_AUTO_REFRESH_SECONDS: u64 = 30;
 const MAX_AUTO_REFRESH_SECONDS: u64 = 86_400;
-const SERVICE_STOP_ATTEMPTS: usize = 20;
 
 #[must_use]
 pub fn parse_auto_refresh_seconds(value: &str) -> Option<u64> {
@@ -129,97 +132,132 @@ async fn service_command(args: &[String], state_path: &Path) -> CliResult {
 }
 
 async fn service_status(json_output: bool, state_path: &Path) -> CliResult {
-    let status = match read_state(state_path) {
-        Ok(Some(state)) => {
-            if ping_endpoint(&state.endpoint).await {
-                ServiceStatus::Running(state)
-            } else {
-                ServiceStatus::Stale(state)
-            }
-        }
-        Ok(None) => ServiceStatus::Stopped,
-        Err(error) if error.kind() == io::ErrorKind::InvalidData => ServiceStatus::Stopped,
-        Err(error) => {
-            return CliResult {
-                exit_code: 1,
-                stdout: String::new(),
-                stderr: format!("service state read failed: {error}\n"),
-            };
-        }
-    };
+    let status = inspect_service(state_path).await.unwrap_or_else(|error| {
+        ServiceStatus::Error(format!("service state/ownership check failed: {error}"))
+    });
+    service_status_result(&status, json_output)
+}
 
-    let exit_code = i32::from(matches!(&status, ServiceStatus::Stale(_)));
-    let stdout = if json_output {
-        render_status_json(&status)
-    } else {
-        render_status_text(&status)
-    };
-
+fn service_status_result(status: &ServiceStatus, json_output: bool) -> CliResult {
     CliResult {
-        exit_code,
-        stdout,
-        stderr: String::new(),
+        exit_code: i32::from(!matches!(
+            status,
+            ServiceStatus::Running(_) | ServiceStatus::Stopped
+        )),
+        stdout: if json_output {
+            render_status_json(status)
+        } else {
+            render_status_text(status)
+        },
+        stderr: match status {
+            ServiceStatus::Error(reason) => format!("{reason}\n"),
+            _ => String::new(),
+        },
+    }
+}
+
+async fn inspect_service(state_path: &Path) -> io::Result<ServiceStatus> {
+    let state = read_state(state_path)?;
+    let starting = ServiceCoordination::startup_active(state_path)?;
+    let active = ServiceCoordination::instance_active(state_path)?;
+    let Some(state) = state else {
+        return Ok(if starting {
+            ServiceStatus::Starting
+        } else if active {
+            ServiceStatus::Unresponsive(None)
+        } else {
+            ServiceStatus::Stopped
+        });
+    };
+    match ping_service(&state.endpoint).await {
+        Ok(identity) if active && identity_matches(&identity, &state) => {
+            Ok(ServiceStatus::Running(state))
+        }
+        Err(error) if !active && !starting && endpoint_is_unavailable(&error) => {
+            Ok(ServiceStatus::Stale(state))
+        }
+        _ => Ok(ServiceStatus::Unresponsive(Some(state))),
     }
 }
 
 async fn service_stop(state_path: &Path) -> CliResult {
-    let Some(state) = (match read_state(state_path) {
-        Ok(state) => state,
-        Err(error) if error.kind() == io::ErrorKind::InvalidData => None,
-        Err(error) => {
-            return CliResult {
-                exit_code: 1,
-                stdout: String::new(),
-                stderr: format!("service state read failed: {error}\n"),
-            };
-        }
-    }) else {
-        return CliResult {
-            exit_code: 0,
-            stdout: "stopped\n".to_owned(),
-            stderr: String::new(),
-        };
-    };
-
-    for _ in 0..SERVICE_STOP_ATTEMPTS {
-        match send_ipc_request(
-            &state.endpoint,
-            r#"{"id":1,"method":"shutdown","params":{}}"#,
-        )
-        .await
-        {
-            Ok(response) if response.contains(r#""status":"shutting_down""#) => {
-                return wait_for_service_shutdown(&state, state_path).await;
-            }
-            Err(error) if endpoint_is_unavailable(&error) => {
-                return remove_service_state(state_path);
-            }
-            _ => sleep(Duration::from_millis(50)).await,
-        }
+    if let Err(error) = read_state(state_path) {
+        return lifecycle_error("service state read failed", error);
     }
-
-    CliResult {
-        exit_code: 1,
-        stdout: render_status_text(&ServiceStatus::Stale(state)),
-        stderr: String::new(),
+    let coordination = match ServiceCoordination::acquire(state_path) {
+        Ok(guard) => guard,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            return service_status_result(&ServiceStatus::Starting, false);
+        }
+        Err(error) => return lifecycle_error("service coordination failed", error),
+    };
+    let state_path = coordination.state_path();
+    let state = match read_state(state_path) {
+        Ok(state) => state,
+        Err(error) => return lifecycle_error("service state read failed", error),
+    };
+    let active = match ServiceCoordination::instance_active(state_path) {
+        Ok(active) => active,
+        Err(error) => return lifecycle_error("service ownership check failed", error),
+    };
+    let Some(state) = state else {
+        return service_status_result(
+            &if active {
+                ServiceStatus::Unresponsive(None)
+            } else {
+                ServiceStatus::Stopped
+            },
+            false,
+        );
+    };
+    match ping_service(&state.endpoint).await {
+        Ok(identity) if active && identity_matches(&identity, &state) => {}
+        Err(error) if !active && endpoint_is_unavailable(&error) => {
+            return remove_service_state(state_path, &state);
+        }
+        _ => return service_status_result(&ServiceStatus::Unresponsive(Some(state)), false),
+    }
+    let request = json!({"id":1,"method":"shutdown","params":{"service":service_identity(&state)}})
+        .to_string();
+    match send_managed_request(&state.endpoint, &request)
+        .await
+        .and_then(|line| response_result(&line))
+    {
+        Ok(result) if result["status"] == "shutting_down" => {
+            wait_for_service_shutdown(&state, state_path).await
+        }
+        _ => service_status_result(&ServiceStatus::Unresponsive(Some(state)), false),
     }
 }
 
 async fn wait_for_service_shutdown(state: &ServiceState, state_path: &Path) -> CliResult {
-    for _ in 0..SERVICE_STOP_ATTEMPTS {
-        match send_ipc_request(&state.endpoint, r#"{"id":1,"method":"ping","params":{}}"#).await {
-            Err(error) if endpoint_is_unavailable(&error) => {
-                return remove_service_state(state_path);
+    let deadline = Instant::now() + bounded_io::IO_TIMEOUT;
+    loop {
+        match ServiceCoordination::instance_active(state_path) {
+            Ok(false) => {
+                if IndexWriterGuard::acquire(&state.index_path).is_ok() {
+                    match timeout_at(deadline, ping_service(&state.endpoint)).await {
+                        Ok(Err(error)) if endpoint_is_unavailable(&error) => {
+                            return remove_service_state(state_path, state);
+                        }
+                        _ => {
+                            return service_status_result(
+                                &ServiceStatus::Unresponsive(Some(state.clone())),
+                                false,
+                            );
+                        }
+                    }
+                }
             }
-            _ => sleep(Duration::from_millis(50)).await,
+            Ok(true) => {}
+            Err(error) => return lifecycle_error("service ownership check failed", error),
         }
+        if Instant::now() >= deadline {
+            break;
+        }
+        sleep(Duration::from_millis(25)).await;
     }
-
-    CliResult {
-        exit_code: 1,
-        stdout: render_status_text(&ServiceStatus::Stale(state.clone())),
-        stderr: String::new(),
-    }
+    service_status_result(&ServiceStatus::Unresponsive(Some(state.clone())), false)
 }
 
 fn endpoint_is_unavailable(error: &io::Error) -> bool {
@@ -229,19 +267,22 @@ fn endpoint_is_unavailable(error: &io::Error) -> bool {
     ) || cfg!(windows) && error.raw_os_error() == Some(2)
 }
 
-fn remove_service_state(state_path: &Path) -> CliResult {
-    if let Err(error) = remove_state(state_path) {
-        return CliResult {
-            exit_code: 1,
-            stdout: String::new(),
-            stderr: format!("service state remove failed: {error}\n"),
-        };
+fn remove_service_state(state_path: &Path, state: &ServiceState) -> CliResult {
+    match remove_state_if_matches(state_path, state) {
+        Ok(true) => service_status_result(&ServiceStatus::Stopped, false),
+        Ok(false) => lifecycle_error(
+            "service state changed during stop",
+            "refusing to remove another state",
+        ),
+        Err(error) => lifecycle_error("service state remove failed", error),
     }
+}
 
+fn lifecycle_error(context: &str, error: impl std::fmt::Display) -> CliResult {
     CliResult {
-        exit_code: 0,
-        stdout: "stopped\n".to_owned(),
-        stderr: String::new(),
+        exit_code: 1,
+        stdout: String::new(),
+        stderr: format!("{context}: {error}\n"),
     }
 }
 
@@ -250,13 +291,53 @@ async fn service_start(args: &[String], state_path: &Path) -> CliResult {
         Ok(parsed) => parsed,
         Err(result) => return result,
     };
-    if let Some(state) = running_state(state_path).await {
-        return service_running_result(&state);
-    }
     let index_path = match resolve_index_path(parsed.index_path) {
         Ok(path) => path,
         Err(result) => return result,
     };
+    if let Err(error) = read_state(state_path) {
+        return lifecycle_error("service state read failed", error);
+    }
+    let coordination = match ServiceCoordination::acquire(state_path) {
+        Ok(guard) => guard,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            return service_status_result(&ServiceStatus::Starting, false);
+        }
+        Err(error) => return lifecycle_error("service coordination failed", error),
+    };
+    let state_path = coordination.state_path();
+    let endpoint = match resolve_managed_endpoint(&parsed.endpoint, state_path) {
+        Ok(endpoint) => endpoint,
+        Err(error) => return lifecycle_error("service endpoint resolve failed", error),
+    };
+    let state = match read_state(state_path) {
+        Ok(state) => state,
+        Err(error) => return lifecycle_error("service state read failed", error),
+    };
+    let active = match ServiceCoordination::instance_active(state_path) {
+        Ok(active) => active,
+        Err(error) => return lifecycle_error("service ownership check failed", error),
+    };
+    if let Some(state) = state {
+        match ping_service(&state.endpoint).await {
+            Ok(identity) if active && identity_matches(&identity, &state) => {
+                if state.index_path != index_path
+                    || !same_endpoint(&state.endpoint, &endpoint)
+                    || state.auto_refresh_seconds != parsed.auto_refresh_seconds
+                {
+                    return lifecycle_error(
+                        "service configuration mismatch",
+                        "stop the running service before changing index, endpoint, or interval",
+                    );
+                }
+                return service_running_result(&state);
+            }
+            Err(error) if !active && endpoint_is_unavailable(&error) => {}
+            _ => return service_status_result(&ServiceStatus::Unresponsive(Some(state)), false),
+        }
+    } else if active {
+        return service_status_result(&ServiceStatus::Unresponsive(None), false);
+    }
     let index_path = {
         let guard = match acquire_service_writer(&index_path) {
             Ok(guard) => guard,
@@ -272,7 +353,7 @@ async fn service_start(args: &[String], state_path: &Path) -> CliResult {
 
     let mut child = match spawn_service_child(
         &index_path,
-        &parsed.endpoint,
+        &endpoint,
         parsed.auto_refresh_seconds,
         state_path,
     ) {
@@ -281,7 +362,7 @@ async fn service_start(args: &[String], state_path: &Path) -> CliResult {
     };
 
     wait_for_started_service(
-        &parsed.endpoint,
+        &endpoint,
         &index_path,
         parsed.auto_refresh_seconds,
         state_path,
@@ -389,15 +470,6 @@ fn validate_index_root_metadata(index_path: &Path, auto_refresh: bool) -> Result
     Ok(())
 }
 
-async fn running_state(state_path: &Path) -> Option<ServiceState> {
-    let state = read_state(state_path).ok().flatten()?;
-    if ping_endpoint(&state.endpoint).await {
-        Some(state)
-    } else {
-        None
-    }
-}
-
 fn service_running_result(state: &ServiceState) -> CliResult {
     CliResult {
         exit_code: 0,
@@ -480,6 +552,7 @@ async fn wait_for_started_service(
     state_path: &Path,
     child: &mut Child,
 ) -> CliResult {
+    let deadline = Instant::now() + Duration::from_secs(2);
     for _ in 0..40 {
         match child.try_wait() {
             Ok(None) => {}
@@ -499,14 +572,19 @@ async fn wait_for_started_service(
                 };
             }
         }
-        if ping_endpoint(endpoint).await {
-            let state = ServiceState {
-                endpoint: endpoint.to_owned(),
-                pid: child.id(),
-                index_path: index_path.to_path_buf(),
-                started_unix_seconds: now_unix_seconds(),
-                auto_refresh_seconds,
-            };
+        let ready_state = match timeout_at(deadline, ping_service(endpoint)).await {
+            Ok(Ok(identity)) => serde_json::from_value::<ServiceState>(identity).ok(),
+            _ => None,
+        };
+        if let Some(state) = ready_state
+            && state.pid == child.id()
+            && state.index_path == index_path
+            && same_endpoint(&state.endpoint, endpoint)
+            && state.auto_refresh_seconds == auto_refresh_seconds
+            && state.instance_id.as_ref().is_some_and(|id| !id.is_empty())
+            && ServiceCoordination::instance_active(state_path).unwrap_or(false)
+            && matches!(child.try_wait(), Ok(None))
+        {
             if let Err(error) = write_state(state_path, &state) {
                 reap_service_child(child);
                 return CliResult {
@@ -526,6 +604,9 @@ async fn wait_for_started_service(
                 stderr: String::new(),
             };
         }
+        if Instant::now() >= deadline {
+            break;
+        }
         sleep(Duration::from_millis(50)).await;
     }
 
@@ -544,11 +625,114 @@ fn reap_service_child(child: &mut Child) {
     }
 }
 
-async fn ping_endpoint(endpoint: &str) -> bool {
-    match send_ipc_request(endpoint, r#"{"id":1,"method":"ping","params":{}}"#).await {
-        Ok(response) => response.contains(r#""status":"ok""#),
-        Err(_) => false,
+fn response_result(line: &str) -> io::Result<serde_json::Value> {
+    let response: serde_json::Value = serde_json::from_str(line)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if response["id"] != 1 || response.get("error").is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid service response",
+        ));
     }
+    response
+        .get("result")
+        .filter(|result| result.is_object())
+        .cloned()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing service result"))
+}
+
+async fn ping_service(endpoint: &str) -> io::Result<serde_json::Value> {
+    let line = send_managed_request(endpoint, r#"{"id":1,"method":"ping","params":{}}"#).await?;
+    let result = response_result(&line)?;
+    if result["status"] != "ok" || !result["service"].is_object() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unverified service identity",
+        ));
+    }
+    Ok(result["service"].clone())
+}
+
+fn service_identity(state: &ServiceState) -> serde_json::Value {
+    json!({"pid":state.pid,"index_path":state.index_path,"endpoint":state.endpoint,"auto_refresh_seconds":state.auto_refresh_seconds,"started_unix_seconds":state.started_unix_seconds,"instance_id":state.instance_id})
+}
+
+fn new_instance_id() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let mut hash = RandomState::new().build_hasher();
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    hash.write_u128(timestamp);
+    hash.write_u32(std::process::id());
+    // A generation discriminator, not an authentication secret.
+    format!("{}-{timestamp}-{:016x}", std::process::id(), hash.finish())
+}
+
+fn identity_matches(identity: &serde_json::Value, state: &ServiceState) -> bool {
+    *identity == service_identity(state)
+}
+
+fn resolve_managed_endpoint(endpoint: &str, state_path: &Path) -> io::Result<String> {
+    if endpoint.is_empty() || endpoint.contains('\0') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "empty or invalid endpoint",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        let _ = state_path;
+        Ok(endpoint.to_owned())
+    }
+    #[cfg(unix)]
+    {
+        let path = if endpoint == DEFAULT_ENDPOINT {
+            state_path.with_file_name("service.sock")
+        } else {
+            std::path::absolute(endpoint)?
+        };
+        Ok(path.to_string_lossy().into_owned())
+    }
+}
+
+fn same_endpoint(left: &str, right: &str) -> bool {
+    #[cfg(windows)]
+    {
+        pipe_name(left).eq_ignore_ascii_case(&pipe_name(right))
+    }
+    #[cfg(unix)]
+    {
+        left == right
+    }
+}
+
+async fn send_managed_request(endpoint: &str, request: &str) -> io::Result<String> {
+    timeout(bounded_io::IO_TIMEOUT, async {
+        #[cfg(windows)]
+        {
+            use tokio::net::windows::named_pipe::ClientOptions;
+            let stream = loop {
+                match ClientOptions::new().open(pipe_name(endpoint)) {
+                    Ok(stream) => break stream,
+                    Err(error) if error.raw_os_error() == Some(231) => {
+                        sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            bounded_io::send_request(stream, request).await
+        }
+        #[cfg(unix)]
+        {
+            bounded_io::send_request(tokio::net::UnixStream::connect(endpoint).await?, request)
+                .await
+        }
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "service request timed out"))?
 }
 
 pub async fn service_run(
@@ -556,6 +740,13 @@ pub async fn service_run(
     endpoint: &str,
     auto_refresh_seconds: Option<u64>,
 ) -> i32 {
+    let state_path = match std::path::absolute(default_state_path()) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("service state path resolve failed: {error}");
+            return 1;
+        }
+    };
     let mut guard = match acquire_service_writer(index_path) {
         Ok(guard) => guard,
         Err(result) => {
@@ -569,18 +760,191 @@ pub async fn service_run(
         eprint!("{}", result.stderr);
         return result.exit_code;
     }
-    let state_path = match std::path::absolute(default_state_path()) {
-        Ok(path) => path,
+    let instance = match ServiceInstanceGuard::acquire(&state_path) {
+        Ok(instance) => instance,
         Err(error) => {
-            eprintln!("service state path resolve failed: {error}");
+            eprintln!("service instance acquire failed: {error}");
             return 1;
         }
     };
-    match serve_ipc_with_guard(&mut guard, endpoint, &[state_path]).await {
+    let endpoint = match resolve_managed_endpoint(endpoint, &state_path) {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            eprintln!("service endpoint resolve failed: {error}");
+            return 1;
+        }
+    };
+    let identity = ServiceState {
+        endpoint,
+        pid: std::process::id(),
+        index_path: guard.index_path().to_path_buf(),
+        started_unix_seconds: now_unix_seconds(),
+        auto_refresh_seconds,
+        instance_id: Some(new_instance_id()),
+    };
+    let result = serve_managed_ipc(&mut guard, &identity, &instance.artifact_paths()).await;
+    // Release the index before instance ownership: absence of instance ownership
+    // is used by stop to confirm that this child's writer has finished.
+    drop(guard);
+    match result {
         Ok(()) => 0,
         Err(error) => {
             eprintln!("service run failed: {error}");
             1
+        }
+    }
+}
+
+async fn handle_managed_connection<S>(
+    guard: &mut IndexWriterGuard,
+    mut stream: S,
+    identity: &ServiceState,
+    artifacts: &[PathBuf],
+) -> io::Result<StreamStatus>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let line = bounded_io::read_request(&mut stream).await?;
+    let request = Request::from_json_line(&line);
+    let outcome = match request {
+        Ok(request) if request.method == "ping" => HandlerOutcome {
+            response: Response::success(
+                request.id,
+                json!({"status":"ok","service":service_identity(identity)}),
+            ),
+            shutdown_requested: false,
+        },
+        Ok(request)
+            if request.method == "shutdown"
+                && request
+                    .params
+                    .get("service")
+                    .is_some_and(|target| !identity_matches(target, identity)) =>
+        {
+            HandlerOutcome {
+                response: Response::error(request.id, "service identity mismatch"),
+                shutdown_requested: false,
+            }
+        }
+        _ => {
+            let index_path = guard.index_path().to_path_buf();
+            handle_json_request_with_guard(&index_path, &line, Some(guard), artifacts)
+        }
+    };
+    let written = bounded_io::write_response(&mut stream, &outcome.response.to_json_line()).await;
+    if outcome.shutdown_requested {
+        return Ok(StreamStatus::ShutdownRequested);
+    }
+    written?;
+    Ok(StreamStatus::ClientDisconnected)
+}
+
+#[cfg(windows)]
+async fn serve_managed_ipc(
+    guard: &mut IndexWriterGuard,
+    identity: &ServiceState,
+    artifacts: &[PathBuf],
+) -> io::Result<()> {
+    use tokio::net::windows::named_pipe::ServerOptions;
+    let endpoint = pipe_name(&identity.endpoint);
+    let mut pending = ServerOptions::new()
+        .first_pipe_instance(true)
+        .reject_remote_clients(true)
+        .create(&endpoint)?;
+    loop {
+        if let Err(error) = pending.connect().await {
+            if error.kind() == io::ErrorKind::Interrupted {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            if matches!(
+                error.kind(),
+                io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+            ) || matches!(error.raw_os_error(), Some(232 | 233))
+            {
+                let _ = pending.disconnect();
+                tokio::task::yield_now().await;
+                continue;
+            }
+            return Err(error);
+        }
+        // Keep an unconnected instance alive while the serial owner serves or scans.
+        // This also preserves the endpoint namespace continuously between requests.
+        let next = ServerOptions::new()
+            .reject_remote_clients(true)
+            .create(&endpoint)?;
+        let connected = std::mem::replace(&mut pending, next);
+        if matches!(
+            handle_managed_connection(guard, connected, identity, artifacts).await,
+            Ok(StreamStatus::ShutdownRequested)
+        ) {
+            return Ok(());
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn serve_managed_ipc(
+    guard: &mut IndexWriterGuard,
+    identity: &ServiceState,
+    artifacts: &[PathBuf],
+) -> io::Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+    struct OwnedSocket {
+        path: PathBuf,
+        device: u64,
+        inode: u64,
+    }
+    impl Drop for OwnedSocket {
+        fn drop(&mut self) {
+            if let Ok(metadata) = std::fs::symlink_metadata(&self.path)
+                && metadata.file_type().is_socket()
+                && metadata.dev() == self.device
+                && metadata.ino() == self.inode
+            {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+    }
+    // A pre-existing socket or ordinary file is not ours to unlink.
+    let listener = tokio::net::UnixListener::bind(&identity.endpoint)?;
+    let metadata = std::fs::symlink_metadata(&identity.endpoint)?;
+    let _socket = OwnedSocket {
+        path: PathBuf::from(&identity.endpoint),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    };
+    std::fs::set_permissions(&identity.endpoint, std::fs::Permissions::from_mode(0o600))?;
+    loop {
+        let (stream, _) = accept_with_retry(|| listener.accept()).await?;
+        if matches!(
+            handle_managed_connection(guard, stream, identity, artifacts).await,
+            Ok(StreamStatus::ShutdownRequested)
+        ) {
+            return Ok(());
+        }
+    }
+}
+
+#[cfg(any(unix, test))]
+async fn accept_with_retry<T, F, Fut>(mut accept: F) -> io::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = io::Result<T>>,
+{
+    loop {
+        match accept().await {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                tokio::task::yield_now().await;
+            }
+            result => return result,
         }
     }
 }
@@ -1151,6 +1515,11 @@ mod startup_tests {
     #[ignore = "startup subprocess helper"]
     fn startup_child_without_endpoint() {
         let index = PathBuf::from(std::env::var_os("AIFS_TEST_STARTUP_INDEX").unwrap());
+        if let Ok(endpoint) = std::env::var("AIFS_TEST_STARTUP_ENDPOINT") {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            assert_eq!(runtime.block_on(service_run(&index, &endpoint, None)), 0);
+            return;
+        }
         let _guard = IndexWriterGuard::acquire(&index).unwrap();
         if let Some(ready) = std::env::var_os("AIFS_TEST_STARTUP_READY") {
             fs::write(PathBuf::from(ready), b"ready").unwrap();
@@ -1213,6 +1582,74 @@ mod startup_tests {
         assert!(IndexWriterGuard::acquire(&fixture.index).is_err());
         drop(owner);
         assert!(IndexWriterGuard::acquire(&fixture.index).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn failed_atomic_state_publication_reaps_ready_owned_child_and_preserves_state() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let fixture = StartupFixture::new("state-write-failure");
+        let endpoint = fixture.endpoint();
+        let state_path = fixture.path.join("state.json");
+        let old = ServiceState {
+            endpoint: "old-endpoint".into(),
+            pid: 99,
+            index_path: fixture.index.clone(),
+            started_unix_seconds: 1,
+            auto_refresh_seconds: None,
+            instance_id: None,
+        };
+        write_state(&state_path, &old).unwrap();
+        let before = fs::read(&state_path).unwrap();
+        let _read_only = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&state_path)
+            .unwrap();
+        let mut child = TestChild(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "startup_tests::startup_child_without_endpoint",
+                    "--ignored",
+                ])
+                .env("AIFS_TEST_STARTUP_INDEX", &fixture.index)
+                .env("AIFS_TEST_STARTUP_ENDPOINT", &endpoint)
+                .env(SERVICE_STATE_ENV, &state_path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let index = std::path::absolute(&fixture.index).unwrap();
+        // The child resolves its new index through the canonical parent.
+        let published_index = fs::canonicalize(index.parent().unwrap())
+            .unwrap()
+            .join(index.file_name().unwrap());
+        let result =
+            wait_for_started_service(&endpoint, &published_index, None, &state_path, &mut child.0)
+                .await;
+        assert_eq!(result.exit_code, 1);
+        assert!(
+            result.stderr.starts_with("service state write failed:"),
+            "{}",
+            result.stderr
+        );
+        assert!(child.0.try_wait().unwrap().is_some());
+        assert!(!ServiceCoordination::instance_active(&state_path).unwrap());
+        assert!(IndexWriterGuard::acquire(&fixture.index).is_ok());
+        assert_eq!(fs::read(&state_path).unwrap(), before);
+        assert!(endpoint_is_unavailable(
+            &ping_service(&endpoint).await.unwrap_err()
+        ));
+        assert!(!fs::read_dir(&fixture.path).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
     }
 
     struct TestChild(Child);

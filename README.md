@@ -14,13 +14,13 @@ The project starts with a Rust core and a CLI prototype before adding the deskto
 
 ## Current Status
 
-Implemented prototype slices include the Rust core/scanner, in-memory and text-file stores, CLI commands, metadata JSON-RPC over stdio/local IPC, manual refresh/reindex/index status, and user-level service start/status/stop.
+Implemented prototype slices include the Rust core/scanner, in-memory and text-file stores, persisted scan exclusions, CLI commands, metadata JSON-RPC over stdio/local IPC, manual refresh/reindex/index status, and user-level service start/status/stop.
 
 The CLI and local daemon are usable for experiments. They are not yet a production desktop app or an authenticated AI data-access boundary.
 
 Automatic refresh is configuration-only at commit `fd2f6a9`: `--auto-refresh-seconds` is parsed and recorded, but `service-run` does not schedule scans yet. Use manual `refresh` until runtime implementation and acceptance tests are complete.
 
-The [reviewed automatic-refresh design](docs/superpowers/specs/2026-07-10-service-auto-refresh-design.md) and [implementation plan](docs/superpowers/plans/2026-07-10-service-auto-refresh.md) separate completed configuration from pending scope persistence, writer isolation, safe publication, bounded connections, scheduling, and platform/performance gates.
+The [reviewed automatic-refresh design](docs/superpowers/specs/2026-07-10-service-auto-refresh-design.md) and [implementation plan](docs/superpowers/plans/2026-07-10-service-auto-refresh.md) separate completed configuration and scan-policy persistence from pending writer isolation, safe publication, bounded connections, scheduling, and platform/performance gates.
 
 ## Quick Start
 
@@ -157,7 +157,7 @@ ai-file-search-daemon service stop
 Current behavior:
 
 - `search` scans a root directory and searches file names in memory.
-- `index` scans a root directory and saves a lightweight local index file with normalized relative paths, file sizes, modified times, and the indexed root path.
+- `index` explicitly rebuilds a local index with normalized relative paths, file sizes, modified times, canonical absolute root, and sorted/deduplicated scan exclusions. Rebuilding replaces old entries and is the explicit way to change root or exclusion scope.
 - `refresh` rescans a root directory, replaces the saved index, and reports added, updated, removed, and unchanged counts.
 - `status` rescans a root directory and reports added, updated, removed, and unchanged counts without rewriting the saved index, with optional JSON output.
 - `stats` reads a saved index and reports file count and total indexed bytes without scanning the root directory, with optional JSON output.
@@ -171,6 +171,8 @@ Current behavior:
 - `--auto-refresh-seconds` accepts `30..=86400` and appears in service status only when configured. It currently records configuration only; it does not run automatic refresh.
 - `ai-file-search-daemon service start` requires an index file with stored root metadata; `index_status`, `refresh`, and `reindex` reject explicit roots that differ from that stored root.
 - `--exclude-name <name>` can be repeated on scanning commands to skip directories with an exact file name match, such as `node_modules`, `.git`, or `target`.
+- For indices built by this version, `refresh`/`status` and JSON-RPC `refresh`/`reindex`/`index_status` inherit stored exclusions when omitted. Explicit exclusions must match the stored set; a mismatch fails before scanning or rewriting the index. Stop any service before explicitly rebuilding its index.
+- Legacy indices without a policy marker keep their previous manual default/explicit-exclusion behavior. Manual refresh does not guess or confirm their original policy. Configured auto-refresh startup requires a known policy and an absolute, resolvable directory root; rebuild legacy indices with the intended exclusions before opting in.
 
 ## JSON-RPC Methods
 
@@ -193,7 +195,7 @@ shutdown -> asks the daemon to stop
 - Search is file-name substring search only.
 - File watching and true incremental updates are not implemented yet; `index_status` and `refresh` currently perform full rescans.
 - Automatic refresh scheduling is not implemented yet. `index_status` is a full scan, not a cheap health check; calling it and then `refresh` performs two scans.
-- Scan exclusions are not persisted yet. Repeat the intended exclusions on current manual scan/refresh operations; planned automatic startup will reject unknown scan policies rather than silently scan excluded directories.
+- Legacy scan policy is unknown until an explicit rebuild. Older readers can query new metadata, but older writers drop policy records; do not mix old and new writers. Malformed or unsupported policy metadata is rejected without changing the file.
 - Current full scans/load/save use O(N) metadata memory and additional clones/text buffers. Large-index peak memory, scan latency, and cross-platform performance budgets have not been validated.
 - `stats` avoids rescanning the filesystem root, but currently still loads and parses the entire saved index; it is not a constant-time metadata lookup.
 - Cross-process writer locks and unique exclusive temporary-file publication are pending. Avoid concurrent writers to the same index, and keep index/state/endpoint files in a trusted user-controlled directory.

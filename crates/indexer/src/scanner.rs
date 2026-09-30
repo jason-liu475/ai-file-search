@@ -6,7 +6,7 @@ use std::time::UNIX_EPOCH;
 
 use ai_file_search_core::PathId;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ScanOptions {
     excluded_names: BTreeSet<String>,
 }
@@ -16,6 +16,10 @@ impl ScanOptions {
     pub fn exclude_name(mut self, name: impl Into<String>) -> Self {
         self.excluded_names.insert(name.into());
         self
+    }
+
+    pub fn excluded_names(&self) -> impl Iterator<Item = &str> {
+        self.excluded_names.iter().map(String::as_str)
     }
 
     fn excludes(&self, path: &Path) -> bool {

@@ -5,14 +5,14 @@ Reviewed: 2026-09-30. Implement in the existing main checkout. This revision rep
 ## Status And Rules
 
 - [x] Task 1: interval configuration only, committed as fd2f6a9.
-- [ ] Task 2: persist and enforce scan scope.
+- [x] Task 2: persist and enforce scan scope.
 - [ ] Task 3: single-writer ownership and safe snapshot publication.
 - [ ] Task 4: shared scan/compare and controlled allocations.
 - [ ] Task 5: bounded managed IPC and safe lifecycle.
 - [ ] Task 6: fixed-delay scheduler and last-attempt status.
 - [ ] Task 7: platform, performance, and documentation acceptance.
 
-The current `service_run` ignores `auto_refresh_seconds`. Tasks 2-7 are planned, not completed; do not enable or advertise automatic refresh before their safety gates pass.
+The current `service_run` uses `auto_refresh_seconds` only to validate root/policy prerequisites, not to schedule scans. Tasks 1-2 are implemented; Tasks 3-7 remain planned. Do not enable or advertise automatic refresh before their safety gates pass.
 
 **Stack:** Rust edition 2024, MSRV 1.96, existing Tokio IPC/time support, serde/serde_json, and repository temporary-directory test helpers. There is no existing `tempfile` dependency; reuse local helpers rather than adding one implicitly.
 
@@ -42,16 +42,18 @@ These checks describe the committed configuration scope, not fresh scheduler acc
 
 Files: `crates/indexer/src/store.rs` and store tests; `crates/cli/src/lib.rs` and CLI tests; `crates/daemon/src/lib.rs` and handler/service tests.
 
-- [ ] Add failing policy serialization tests: sorted/deduplicated exclusion names, escaped values, known empty policy, absent legacy policy, malformed/unsupported policy version, and preservation across save/open.
-- [ ] Add failing tests proving automatic-start validation rejects unknown policy and ambiguous relative roots before spawning. An excluded directory must stay excluded through refresh and index status.
-- [ ] Add policy metadata to `FileIndexStore` using existing `meta` records and escaping. Preserve `aifs-index-v1` reads; no marker is `None`/unknown rather than an empty set.
-- [ ] Explicit CLI `index` records canonical absolute root and the requested policy. For an unknown legacy policy, instruct the user to rebuild explicitly; do not guess it during `refresh`.
-- [ ] For a known policy, omitted exclusions in CLI/daemon refresh and index status inherit stored scope; explicit matching exclusions are allowed and mismatches fail before scanning. Changing policy requires an explicit `index` rebuild.
-- [ ] Preserve legacy manual operation behavior and existing root mismatch errors. Policy metadata must never be silently dropped by the upgraded writer.
-- [ ] Test metadata-only additions, empty exclusion sets, root alias equality, index-inside-root exclusions, and older file reads. Document old-writer incompatibility.
-- [ ] Run focused indexer/CLI/daemon tests, then workspace tests; commit/push `feat: persist index scan policy`.
+- [x] Add failing policy serialization tests: sorted/deduplicated exclusion names, escaped values, known empty policy, absent legacy policy, malformed/unsupported policy version, and preservation across save/open.
+- [x] Add failing tests proving automatic-start validation rejects unknown policy and ambiguous relative roots before spawning. An excluded directory stays excluded through refresh and index status.
+- [x] Add policy metadata to `FileIndexStore` using existing `meta` records and escaping. Preserve `aifs-index-v1` reads; no marker is `None`/unknown rather than an empty set.
+- [x] Explicit CLI `index` records canonical absolute root and the requested policy. Unknown legacy policy requires explicit rebuild; ordinary `refresh` does not guess it.
+- [x] For a known policy, omitted exclusions in CLI/daemon refresh and index status inherit stored scope; matching explicit sets are allowed and mismatches fail before scanning. Changing policy requires an explicit `index` rebuild.
+- [x] Preserve legacy manual behavior and existing daemon root mismatch errors. The upgraded writer preserves policy metadata.
+- [x] Test metadata-only additions, empty exclusion sets, root alias equality, index-inside-root exclusions, and older file reads. Document old-writer incompatibility.
+- [x] Run focused tests and full workspace verification: 123 Windows tests pass (46 added), `cargo fmt --check` and workspace Clippy pass. Deliver in `feat: persist index scan policy`.
 
-No timer is connected in this task. Do not assume the configuration parser alone performs these new startup checks.
+No timer is connected in this task. Startup policy/root checks now run for configured auto refresh in both parent and hidden child; no-auto legacy lifecycle behavior is preserved. Native Linux/macOS and performance gates remain unverified.
+
+Shared indexer APIs: `FileIndexStore::new` creates an empty rebuild destination without reading old contents; `scan_policy`/`set_scan_policy` distinguish unknown and known-empty scope; `resolve_scan_options(Option<ScanOptions>)` enforces inheritance/matching; `ScanOptions::excluded_names` exposes sorted, deduplicated names. No dependency was added.
 
 ## Task 3: Single Writer And Safe Publication
 

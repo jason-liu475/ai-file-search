@@ -248,7 +248,9 @@ async fn service_start(args: &[String], state_path: &Path) -> CliResult {
         Ok(path) => path,
         Err(result) => return result,
     };
-    if let Err(result) = validate_index_root_metadata(&index_path) {
+    if let Err(result) =
+        validate_index_root_metadata(&index_path, parsed.auto_refresh_seconds.is_some())
+    {
         return result;
     }
 
@@ -317,23 +319,50 @@ fn resolve_index_path(index_path: &str) -> Result<PathBuf, CliResult> {
     })
 }
 
-fn validate_index_root_metadata(index_path: &Path) -> Result<(), CliResult> {
+fn validate_index_root_metadata(index_path: &Path, auto_refresh: bool) -> Result<(), CliResult> {
     let store = FileIndexStore::open(index_path).map_err(|error| CliResult {
         exit_code: 1,
         stdout: String::new(),
         stderr: format!("index open failed: {error}\n"),
     })?;
 
-    if store.root_path().is_some() {
-        Ok(())
-    } else {
-        Err(CliResult {
+    let root = store.root_path().ok_or_else(|| CliResult {
+        exit_code: 1,
+        stdout: String::new(),
+        stderr: "index root metadata missing: run ai-file-search index <root> <index-file>\n"
+            .to_owned(),
+    })?;
+    if !auto_refresh {
+        return Ok(());
+    }
+
+    if store.scan_policy().is_none() {
+        return Err(CliResult {
             exit_code: 1,
             stdout: String::new(),
-            stderr: "index root metadata missing: run ai-file-search index <root> <index-file>\n"
-                .to_owned(),
-        })
+            stderr: "index scan policy missing: rebuild with ai-file-search index <root> <index-file> [--exclude-name <name>] before enabling auto refresh\n".to_owned(),
+        });
     }
+    if !root.is_absolute() {
+        return Err(CliResult {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "index root must be absolute for auto refresh: rebuild with ai-file-search index <root> <index-file>\n".to_owned(),
+        });
+    }
+    let root = std::fs::canonicalize(root).map_err(|error| CliResult {
+        exit_code: 1,
+        stdout: String::new(),
+        stderr: format!("index root resolve failed: {error}\n"),
+    })?;
+    if !root.is_dir() {
+        return Err(CliResult {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "index root is not a directory\n".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 async fn running_state(state_path: &Path) -> Option<ServiceState> {
@@ -460,7 +489,12 @@ pub async fn service_run(
     endpoint: &str,
     auto_refresh_seconds: Option<u64>,
 ) -> i32 {
-    let _ = auto_refresh_seconds;
+    if auto_refresh_seconds.is_some()
+        && let Err(result) = validate_index_root_metadata(index_path, true)
+    {
+        eprint!("{}", result.stderr);
+        return result.exit_code;
+    }
     match serve_ipc(index_path, endpoint).await {
         Ok(()) => 0,
         Err(error) => {
@@ -607,6 +641,11 @@ fn index_status(index_path: &Path, request: &Request) -> Response {
         Err(message) => return Response::error(request.id, message),
     };
 
+    let options = match store.resolve_scan_options(options) {
+        Ok(options) => options,
+        Err(message) => return Response::error(request.id, message),
+    };
+
     let files = match scan_files_for_index(&root, index_path, options) {
         Ok(files) => files,
         Err(error) => return Response::error(request.id, format!("scan failed: {error}")),
@@ -640,6 +679,11 @@ fn refresh(index_path: &Path, request: &Request) -> Response {
     };
     let root = match index_root(&store, &request.params) {
         Ok(root) => root,
+        Err(message) => return Response::error(request.id, message),
+    };
+
+    let options = match store.resolve_scan_options(options) {
+        Ok(options) => options,
         Err(message) => return Response::error(request.id, message),
     };
 
@@ -696,9 +740,9 @@ fn same_root_path(left: &Path, right: &Path) -> bool {
     }
 }
 
-fn scan_options(params: &serde_json::Value) -> Result<ScanOptions, &'static str> {
+fn scan_options(params: &serde_json::Value) -> Result<Option<ScanOptions>, &'static str> {
     let Some(excluded_names) = params.get("exclude_names") else {
-        return Ok(ScanOptions::default());
+        return Ok(None);
     };
     let Some(excluded_names) = excluded_names.as_array() else {
         return Err("exclude_names must be an array of strings");
@@ -711,6 +755,7 @@ fn scan_options(params: &serde_json::Value) -> Result<ScanOptions, &'static str>
                 .map(|name| options.exclude_name(name.to_owned()))
                 .ok_or("exclude_names must be an array of strings")
         })
+        .map(Some)
 }
 
 fn scan_files_for_index(

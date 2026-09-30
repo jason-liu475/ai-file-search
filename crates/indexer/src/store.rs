@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use ai_file_search_core::PathId;
 
-use crate::IndexedFile;
+use crate::{IndexedFile, ScanOptions};
 
 const INDEX_HEADER: &str = "aifs-index-v1";
 
@@ -127,15 +127,28 @@ pub struct FileIndexStore {
     path: PathBuf,
     memory: MemoryIndexStore,
     root_path: Option<PathBuf>,
+    scan_policy: Option<ScanOptions>,
 }
 
 impl FileIndexStore {
+    /// Creates an empty destination without reading or modifying an existing index.
+    #[must_use]
+    pub fn new(path: &Path) -> Self {
+        Self {
+            path: path.to_owned(),
+            memory: MemoryIndexStore::new(),
+            root_path: None,
+            scan_policy: None,
+        }
+    }
+
     /// Opens an index file, creating an empty in-memory store when the file does
     /// not exist yet.
     ///
     /// # Errors
     ///
-    /// Returns an error when the index file exists but cannot be read.
+    /// Returns an error when the index cannot be read or its scan policy metadata
+    /// is malformed or uses an unsupported version.
     pub fn open(path: &Path) -> io::Result<Self> {
         let mut memory = MemoryIndexStore::new();
 
@@ -149,9 +162,32 @@ impl FileIndexStore {
                 Box::new(contents.lines())
             };
             let mut root_path = None;
+            let mut policy_seen = false;
+            let mut exclusions_seen = false;
+            let mut policy_options = ScanOptions::default();
 
             for line in records.filter(|line| !line.is_empty()) {
                 if has_header {
+                    let mut parts = line.splitn(3, '\t');
+                    match (parts.next(), parts.next()) {
+                        (Some("meta"), Some("scan_policy")) => {
+                            if policy_seen || parts.next() != Some("1") {
+                                return Err(invalid_scan_policy());
+                            }
+                            policy_seen = true;
+                            continue;
+                        }
+                        (Some("meta"), Some("exclude_name")) => {
+                            let Some(value) = parts.next() else {
+                                return Err(invalid_scan_policy());
+                            };
+                            exclusions_seen = true;
+                            policy_options =
+                                policy_options.exclude_name(unescape_metadata_value(value));
+                            continue;
+                        }
+                        _ => {}
+                    }
                     if let Some(root) = parse_root_metadata_record(line) {
                         root_path = Some(root);
                         continue;
@@ -163,18 +199,19 @@ impl FileIndexStore {
                 memory.upsert_file(parse_index_record(line, has_header));
             }
 
+            if exclusions_seen && !policy_seen {
+                return Err(invalid_scan_policy());
+            }
+
             return Ok(Self {
                 path: path.to_owned(),
                 memory,
                 root_path,
+                scan_policy: policy_seen.then_some(policy_options),
             });
         }
 
-        Ok(Self {
-            path: path.to_owned(),
-            memory,
-            root_path: None,
-        })
+        Ok(Self::new(path))
     }
 
     pub fn upsert_file(&mut self, file: IndexedFile) {
@@ -196,6 +233,34 @@ impl FileIndexStore {
     #[must_use]
     pub fn root_path(&self) -> Option<&Path> {
         self.root_path.as_deref()
+    }
+
+    pub fn set_scan_policy(&mut self, options: ScanOptions) {
+        self.scan_policy = Some(options);
+    }
+
+    #[must_use]
+    pub fn scan_policy(&self) -> Option<&ScanOptions> {
+        self.scan_policy.as_ref()
+    }
+
+    /// Inherits known scope, preserving default behavior for unknown legacy scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when explicitly requested exclusions differ from the
+    /// persisted policy. Changing scope requires an explicit index rebuild.
+    pub fn resolve_scan_options(
+        &self,
+        requested: Option<ScanOptions>,
+    ) -> Result<ScanOptions, &'static str> {
+        match (&self.scan_policy, requested) {
+            (Some(stored), Some(requested)) if *stored != requested => {
+                Err("exclude_names does not match stored scan policy")
+            }
+            (Some(stored), _) => Ok(stored.clone()),
+            (None, requested) => Ok(requested.unwrap_or_default()),
+        }
     }
 
     #[must_use]
@@ -228,6 +293,14 @@ impl FileIndexStore {
         if let Some(root_path) = &self.root_path {
             lines.push(format_metadata_record("root", &root_path.to_string_lossy()));
         }
+        if let Some(policy) = &self.scan_policy {
+            lines.push(format_metadata_record("scan_policy", "1"));
+            lines.extend(
+                policy
+                    .excluded_names()
+                    .map(|name| format_metadata_record("exclude_name", name)),
+            );
+        }
         lines.extend(self.memory.all_files().iter().map(format_index_record));
 
         let mut contents = lines.join("\n");
@@ -242,6 +315,13 @@ impl FileIndexStore {
     pub fn search_by_name(&self, query: &str) -> Vec<IndexedFile> {
         self.memory.search_by_name(query)
     }
+}
+
+fn invalid_scan_policy() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "invalid or unsupported scan policy metadata",
+    )
 }
 
 fn is_metadata_record(line: &str) -> bool {

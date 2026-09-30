@@ -56,11 +56,12 @@ fn index_command_writes_index_file() {
     assert_eq!(result.stdout, "indexed 1 files\n");
     let index_contents = fs::read_to_string(index_path).expect("index file should be readable");
     let lines = index_contents.lines().collect::<Vec<_>>();
-    assert_eq!(lines.len(), 3);
+    assert_eq!(lines.len(), 4);
     assert_eq!(lines[0], "aifs-index-v1");
     assert!(lines[1].starts_with("meta\troot\t"));
+    assert_eq!(lines[2], "meta\tscan_policy\t1");
 
-    let fields = lines[2].split('\t').collect::<Vec<_>>();
+    let fields = lines[3].split('\t').collect::<Vec<_>>();
     assert_eq!(fields.len(), 3);
     assert_eq!(fields[0], "6");
     assert!(
@@ -246,7 +247,8 @@ fn refresh_command_removes_stale_paths_from_saved_index() {
     assert_eq!(stale_query_result.stdout, "");
 
     let store = FileIndexStore::open(&index_path).expect("refreshed index should open");
-    assert_eq!(store.root_path(), Some(fixture.path()));
+    let canonical_root = fs::canonicalize(fixture.path()).expect("root should resolve");
+    assert_eq!(store.root_path(), Some(canonical_root.as_path()));
 }
 
 #[test]

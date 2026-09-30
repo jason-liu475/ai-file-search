@@ -456,6 +456,261 @@ fn handler_accepts_explicit_index_status_root_without_metadata() {
     );
 }
 
+#[test]
+fn handler_scan_policy_refresh_inherits_omitted_exclusions() {
+    assert_inherited_scan_policy("refresh");
+}
+
+#[test]
+fn handler_scan_policy_reindex_inherits_omitted_exclusions() {
+    assert_inherited_scan_policy("reindex");
+}
+
+#[test]
+fn handler_scan_policy_index_status_inherits_omitted_exclusions() {
+    assert_inherited_scan_policy("index_status");
+}
+
+fn assert_inherited_scan_policy(method: &str) {
+    let fixture = TestDir::new(&format!("scan-policy-inherit-{method}"));
+    let root = fixture.path().join("root");
+    fs::create_dir_all(root.join("target")).expect("excluded directory should be created");
+    fs::write(root.join("kept.txt"), "kept").expect("kept file should be written");
+    let index_path = root.join("index.txt");
+    save_policy_index(
+        &index_path,
+        &root,
+        ScanOptions::default().exclude_name("target"),
+    );
+    fs::write(root.join("added.txt"), "added").expect("added file should be written");
+    fs::write(root.join("target/secret.txt"), "secret").expect("excluded file should be written");
+    let before = fs::read(&index_path).expect("index should be readable");
+
+    let response = policy_request(&index_path, method, serde_json::json!({}));
+    let mut summary = serde_json::json!({
+        "scanned_files": 2, "added": 1, "updated": 0, "removed": 0, "unchanged": 1,
+    });
+    if method == "index_status" {
+        summary["needs_refresh"] = serde_json::json!(true);
+    }
+    assert_eq!(response, Response::success(40, summary));
+    let store = FileIndexStore::open(&index_path).expect("index should reopen");
+    assert!(store.search_by_name("secret").is_empty());
+    assert_eq!(
+        store.scan_policy(),
+        Some(&ScanOptions::default().exclude_name("target"))
+    );
+    if method == "index_status" {
+        assert_eq!(fs::read(&index_path).unwrap(), before);
+    } else {
+        assert_eq!(store.search_by_name("added").len(), 1);
+    }
+}
+
+#[test]
+fn handler_scan_policy_accepts_matching_reordered_duplicate_exclusions() {
+    for method in ["refresh", "reindex", "index_status"] {
+        let fixture = TestDir::new(&format!("scan-policy-matching-{method}"));
+        let root = fixture.path().join("root");
+        fs::create_dir_all(root.join("target")).unwrap();
+        fs::create_dir_all(root.join("node_modules")).unwrap();
+        fs::write(root.join("kept.txt"), "kept").unwrap();
+        fs::write(root.join("target/secret.txt"), "secret").unwrap();
+        fs::write(root.join("node_modules/ignored.txt"), "ignored").unwrap();
+        let index_path = fixture.path().join("index.txt");
+        save_policy_index(
+            &index_path,
+            &root,
+            ScanOptions::default()
+                .exclude_name("target")
+                .exclude_name("node_modules"),
+        );
+
+        let response = policy_request(
+            &index_path,
+            method,
+            serde_json::json!({"exclude_names": ["node_modules", "target", "target"]}),
+        );
+        let mut summary = serde_json::json!({
+            "scanned_files": 1, "added": 0, "updated": 0, "removed": 0, "unchanged": 1,
+        });
+        if method == "index_status" {
+            summary["needs_refresh"] = serde_json::json!(false);
+        }
+        assert_eq!(response, Response::success(40, summary));
+        assert_eq!(
+            FileIndexStore::open(&index_path).unwrap().scan_policy(),
+            Some(
+                &ScanOptions::default()
+                    .exclude_name("target")
+                    .exclude_name("node_modules")
+            ),
+        );
+    }
+}
+
+#[test]
+fn handler_scan_policy_rejects_explicit_empty_exclusions_without_writing() {
+    for method in ["refresh", "reindex", "index_status"] {
+        let fixture = TestDir::new(&format!("scan-policy-empty-mismatch-{method}"));
+        let root = fixture.path().join("root");
+        fs::create_dir_all(root.join("target")).unwrap();
+        fs::write(root.join("target/secret.txt"), "secret").unwrap();
+        let index_path = fixture.path().join("index.txt");
+        save_policy_index(
+            &index_path,
+            &root,
+            ScanOptions::default().exclude_name("target"),
+        );
+        let before = fs::read(&index_path).unwrap();
+
+        let response = policy_request(
+            &index_path,
+            method,
+            serde_json::json!({"exclude_names": []}),
+        );
+
+        assert_eq!(
+            response,
+            Response::error(40, "exclude_names does not match stored scan policy")
+        );
+        assert_eq!(fs::read(&index_path).unwrap(), before);
+    }
+}
+
+#[test]
+fn handler_scan_policy_mismatch_rejects_before_scanning_unresolvable_root() {
+    for method in ["refresh", "reindex", "index_status"] {
+        let fixture = TestDir::new(&format!("scan-policy-before-scan-{method}"));
+        let root = fixture.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let index_path = fixture.path().join("index.txt");
+        save_policy_index(
+            &index_path,
+            &root,
+            ScanOptions::default().exclude_name("target"),
+        );
+        fs::remove_dir(&root).unwrap();
+        let before = fs::read(&index_path).unwrap();
+
+        let response = policy_request(
+            &index_path,
+            method,
+            serde_json::json!({"exclude_names": ["node_modules"]}),
+        );
+
+        assert_eq!(
+            response,
+            Response::error(40, "exclude_names does not match stored scan policy")
+        );
+        assert_eq!(fs::read(&index_path).unwrap(), before);
+    }
+}
+
+#[test]
+fn handler_scan_policy_known_empty_rejects_nonempty_exclusions() {
+    for method in ["refresh", "reindex", "index_status"] {
+        let fixture = TestDir::new(&format!("scan-policy-known-empty-{method}"));
+        let root = fixture.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let index_path = fixture.path().join("index.txt");
+        save_policy_index(&index_path, &root, ScanOptions::default());
+        let before = fs::read(&index_path).unwrap();
+
+        let response = policy_request(
+            &index_path,
+            method,
+            serde_json::json!({"exclude_names": ["target"]}),
+        );
+
+        assert_eq!(
+            response,
+            Response::error(40, "exclude_names does not match stored scan policy")
+        );
+        assert_eq!(fs::read(&index_path).unwrap(), before);
+    }
+}
+
+#[test]
+fn handler_scan_policy_legacy_default_stays_unknown() {
+    assert_legacy_scan_policy(&serde_json::json!({}), 2);
+}
+
+#[test]
+fn handler_scan_policy_legacy_explicit_exclusions_stay_unknown() {
+    assert_legacy_scan_policy(&serde_json::json!({"exclude_names": ["target"]}), 1);
+}
+
+fn assert_legacy_scan_policy(params: &serde_json::Value, scanned_files: u64) {
+    for method in ["refresh", "reindex", "index_status"] {
+        let fixture = TestDir::new(&format!("scan-policy-legacy-{scanned_files}-{method}"));
+        let root = fixture.path().join("root");
+        fs::create_dir_all(root.join("target")).unwrap();
+        fs::write(root.join("kept.txt"), "kept").unwrap();
+        fs::write(root.join("target/secret.txt"), "secret").unwrap();
+        let index_path = fixture.path().join("index.txt");
+        save_scanned_index(&index_path, &root);
+        let before = fs::read(&index_path).unwrap();
+
+        let response = policy_request(&index_path, method, params.clone());
+        let value: serde_json::Value = serde_json::from_str(&response.to_json_line()).unwrap();
+        assert_eq!(value["result"]["scanned_files"], scanned_files);
+        assert!(
+            FileIndexStore::open(&index_path)
+                .unwrap()
+                .scan_policy()
+                .is_none()
+        );
+        if method == "index_status" {
+            assert_eq!(fs::read(&index_path).unwrap(), before);
+        }
+    }
+}
+
+#[test]
+fn handler_scan_policy_invalid_exclusions_keep_existing_error() {
+    let fixture = TestDir::new("scan-policy-invalid-exclusions");
+    let index_path = fixture.path().join("index.txt");
+    save_index(&index_path, Vec::new());
+    let before = fs::read(&index_path).unwrap();
+    for method in ["refresh", "reindex", "index_status"] {
+        for invalid in [
+            serde_json::json!(null),
+            serde_json::json!(1),
+            serde_json::json!("target"),
+            serde_json::json!(["target", false]),
+        ] {
+            let response = policy_request(
+                &index_path,
+                method,
+                serde_json::json!({"exclude_names": invalid}),
+            );
+            assert_eq!(
+                response,
+                Response::error(40, "exclude_names must be an array of strings")
+            );
+            assert_eq!(fs::read(&index_path).unwrap(), before);
+        }
+    }
+}
+
+fn policy_request(index_path: &Path, method: &str, params: serde_json::Value) -> Response {
+    let mut request = serde_json::json!({"id": 40, "method": method});
+    request["params"] = params;
+    handle_json_line(index_path, &request.to_string())
+}
+
+fn save_policy_index(index_path: &Path, root: &Path, options: ScanOptions) {
+    let files = Scanner::new(options.clone())
+        .scan(root)
+        .expect("root should scan");
+    let mut store = FileIndexStore::open(index_path).expect("store should open");
+    store.set_root_path(root);
+    store.set_scan_policy(options);
+    store.replace_all(files);
+    store.save().expect("store should save");
+}
+
 struct TestDir {
     path: PathBuf,
 }

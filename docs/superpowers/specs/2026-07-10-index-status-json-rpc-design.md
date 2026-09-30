@@ -1,6 +1,6 @@
 # Index Status JSON-RPC Design
 
-Reviewed: 2026-09-30. `index_status` is implemented; the scan-policy and bounded-allocation changes referenced below remain planned.
+Reviewed: 2026-09-30. `index_status` and persisted scan-policy inheritance are implemented; the bounded-allocation changes referenced below remain planned.
 
 ## Goal
 
@@ -77,7 +77,7 @@ Parameter rules:
 - When neither stored root metadata nor an explicit `root` exists, return `missing string param: root`.
 - `exclude_names` is optional and must be an array of strings.
 
-The current store does not persist exclusions; callers must repeat intended exclusions for current operations. After the [scan-policy prerequisite](2026-07-10-service-auto-refresh-design.md#scan-scope-and-compatibility) is implemented, omitted exclusions inherit a known stored policy, matching explicit exclusions are accepted, and mismatches fail before scanning. Legacy unknown policy retains manual compatibility; it cannot silently enable automatic scanning.
+Under the [persisted scan-policy contract](2026-07-10-service-auto-refresh-design.md#scan-scope-and-compatibility), omitted exclusions inherit a known stored policy, matching explicit exclusions are accepted, and mismatches fail before scanning. Explicit `exclude_names: []` means a requested empty policy, not omission. Legacy unknown policy retains manual compatibility and is not confirmed by a status request; it cannot silently enable automatic scanning.
 
 ## Response Contract
 

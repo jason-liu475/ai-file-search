@@ -38,12 +38,12 @@ pub fn run(args: impl IntoIterator<Item = impl AsRef<str>>) -> CliResult {
         Some("refresh") if parsed.positionals.len() == 2 && !parsed.json => refresh(
             &parsed.positionals[0],
             &parsed.positionals[1],
-            parsed.scan_options(),
+            parsed.requested_scan_options(),
         ),
         Some("status") if parsed.positionals.len() == 2 => status(
             &parsed.positionals[0],
             &parsed.positionals[1],
-            parsed.scan_options(),
+            parsed.requested_scan_options(),
             parsed.output_format(),
         ),
         Some("stats") if parsed.positionals.len() == 1 && parsed.excluded_names.is_empty() => {
@@ -119,6 +119,10 @@ impl ParsedArgs {
             .fold(ScanOptions::default(), |options, name| {
                 options.exclude_name(name.clone())
             })
+    }
+
+    fn requested_scan_options(&self) -> Option<ScanOptions> {
+        (!self.excluded_names.is_empty()).then(|| self.scan_options())
     }
 
     fn output_format(&self) -> OutputFormat {
@@ -283,9 +287,18 @@ fn stats(index_path: &str, output_format: OutputFormat) -> CliResult {
 }
 
 fn index(root: &str, index_path: &str, options: ScanOptions) -> CliResult {
-    let root = Path::new(root);
+    let root = match fs::canonicalize(root) {
+        Ok(root) => root,
+        Err(error) => {
+            return CliResult {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: format!("scan failed: {error}\n"),
+            };
+        }
+    };
     let index_path = Path::new(index_path);
-    let files = match scan_files_for_index(root, index_path, options) {
+    let files = match scan_files_for_index(&root, index_path, options.clone()) {
         Ok(files) => files,
         Err(error) => {
             return CliResult {
@@ -297,20 +310,10 @@ fn index(root: &str, index_path: &str, options: ScanOptions) -> CliResult {
     };
     let file_count = files.len();
 
-    let mut store = match FileIndexStore::open(index_path) {
-        Ok(store) => store,
-        Err(error) => {
-            return CliResult {
-                exit_code: 1,
-                stdout: String::new(),
-                stderr: format!("index open failed: {error}\n"),
-            };
-        }
-    };
-    store.set_root_path(root);
-    for file in files {
-        store.upsert_file(file);
-    }
+    let mut store = FileIndexStore::new(index_path);
+    store.set_root_path(&root);
+    store.set_scan_policy(options);
+    store.replace_all(files);
     if let Err(error) = store.save() {
         return CliResult {
             exit_code: 1,
@@ -329,23 +332,11 @@ fn index(root: &str, index_path: &str, options: ScanOptions) -> CliResult {
 fn status(
     root: &str,
     index_path: &str,
-    options: ScanOptions,
+    requested_options: Option<ScanOptions>,
     output_format: OutputFormat,
 ) -> CliResult {
     let root = Path::new(root);
     let index_path = Path::new(index_path);
-    let files = match scan_files_for_index(root, index_path, options) {
-        Ok(files) => files,
-        Err(error) => {
-            return CliResult {
-                exit_code: 1,
-                stdout: String::new(),
-                stderr: format!("scan failed: {error}\n"),
-            };
-        }
-    };
-    let file_count = files.len();
-
     let store = match FileIndexStore::open(index_path) {
         Ok(store) => store,
         Err(error) => {
@@ -356,6 +347,37 @@ fn status(
             };
         }
     };
+    let options = match store.resolve_scan_options(requested_options) {
+        Ok(options) => options,
+        Err(error) => {
+            return CliResult {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: format!("{error}\n"),
+            };
+        }
+    };
+    let root = match index_root(&store, root) {
+        Ok(root) => root,
+        Err(error) => {
+            return CliResult {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: format!("{error}\n"),
+            };
+        }
+    };
+    let files = match scan_files_for_index(&root, index_path, options) {
+        Ok(files) => files,
+        Err(error) => {
+            return CliResult {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: format!("scan failed: {error}\n"),
+            };
+        }
+    };
+    let file_count = files.len();
     let old_files = store.all_files();
     let summary = RefreshSummary::compare(&old_files, &files);
 
@@ -371,21 +393,9 @@ fn status(
     }
 }
 
-fn refresh(root: &str, index_path: &str, options: ScanOptions) -> CliResult {
+fn refresh(root: &str, index_path: &str, requested_options: Option<ScanOptions>) -> CliResult {
     let root = Path::new(root);
     let index_path = Path::new(index_path);
-    let files = match scan_files_for_index(root, index_path, options) {
-        Ok(files) => files,
-        Err(error) => {
-            return CliResult {
-                exit_code: 1,
-                stdout: String::new(),
-                stderr: format!("scan failed: {error}\n"),
-            };
-        }
-    };
-    let file_count = files.len();
-
     let mut store = match FileIndexStore::open(index_path) {
         Ok(store) => store,
         Err(error) => {
@@ -396,9 +406,40 @@ fn refresh(root: &str, index_path: &str, options: ScanOptions) -> CliResult {
             };
         }
     };
+    let options = match store.resolve_scan_options(requested_options) {
+        Ok(options) => options,
+        Err(error) => {
+            return CliResult {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: format!("{error}\n"),
+            };
+        }
+    };
+    let root = match index_root(&store, root) {
+        Ok(root) => root,
+        Err(error) => {
+            return CliResult {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: format!("{error}\n"),
+            };
+        }
+    };
+    let files = match scan_files_for_index(&root, index_path, options) {
+        Ok(files) => files,
+        Err(error) => {
+            return CliResult {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: format!("scan failed: {error}\n"),
+            };
+        }
+    };
+    let file_count = files.len();
     let old_files = store.all_files();
     let summary = RefreshSummary::compare(&old_files, &files);
-    store.set_root_path(root);
+    store.set_root_path(&root);
     store.replace_all(files);
     if let Err(error) = store.save() {
         return CliResult {
@@ -413,6 +454,23 @@ fn refresh(root: &str, index_path: &str, options: ScanOptions) -> CliResult {
         stdout: format_summary("refreshed", file_count, &summary),
         stderr: String::new(),
     }
+}
+
+fn index_root(store: &FileIndexStore, requested_root: &Path) -> Result<PathBuf, &'static str> {
+    if store.scan_policy().is_none() {
+        return Ok(requested_root.to_path_buf());
+    }
+
+    let stored_root = store.root_path().ok_or("index has no stored root")?;
+    let stored_root =
+        fs::canonicalize(stored_root).map_err(|_| "root does not match stored index root")?;
+    let requested_root =
+        fs::canonicalize(requested_root).map_err(|_| "root does not match stored index root")?;
+    if stored_root != requested_root {
+        return Err("root does not match stored index root");
+    }
+
+    Ok(stored_root)
 }
 
 fn format_summary(action: &str, file_count: usize, summary: &RefreshSummary) -> String {
@@ -445,7 +503,14 @@ fn scan_files_for_index(
 }
 
 fn relative_index_path(root: &Path, index_path: &Path) -> Option<String> {
-    index_path.strip_prefix(root).ok().map(|relative_path| {
+    let root = fs::canonicalize(root).ok()?;
+    let index_path = fs::canonicalize(index_path).ok().or_else(|| {
+        let absolute_path = std::path::absolute(index_path).ok()?;
+        let parent = fs::canonicalize(absolute_path.parent()?).ok()?;
+        Some(parent.join(absolute_path.file_name()?))
+    })?;
+
+    index_path.strip_prefix(&root).ok().map(|relative_path| {
         relative_path
             .components()
             .collect::<PathBuf>()

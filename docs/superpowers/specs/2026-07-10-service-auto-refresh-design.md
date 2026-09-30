@@ -4,7 +4,7 @@ Reviewed: 2026-09-30. This revision supersedes the original timer, storage, and 
 
 ## Implementation Status
 
-Commit fd2f6a9 implements interval parsing, child argument forwarding, and startup-state rendering only. The current `service_run` ignores the interval and calls the existing IPC server. Scheduled refresh, policy persistence, writer isolation, bounded service connections, and the runtime status below are NOT implemented.
+Implemented: interval parsing, child argument forwarding, startup-state rendering, scan-policy persistence, manual policy inheritance/mismatch rejection, explicit rebuilds, and configured-start root/policy validation. The current `service_run` uses the interval only for prerequisite validation, then calls the existing IPC server without scheduling scans. Scheduled refresh, writer isolation, bounded service connections, and the runtime status below are NOT implemented.
 
 The configuration flag is not evidence that an automatic scan has run. Do not document this as an active feature until the implementation and platform acceptance gates pass.
 
@@ -40,9 +40,9 @@ These safeguards also benefit manual refresh. Introducing a timer must not turn 
 
 ## Scan Scope And Compatibility
 
-The current index stores a root but does not store `--exclude-name` options. Using `ScanOptions::default()` during automatic refresh would silently add previously excluded directories. Automatic refresh must instead use the persisted policy.
+The index now persists `--exclude-name` options. Using `ScanOptions::default()` during automatic refresh would still silently add excluded directories; the future scheduler must use the persisted policy.
 
-Extend the existing `aifs-index-v1` metadata records with a policy marker and repeated excluded directory names:
+The existing `aifs-index-v1` metadata records now include a policy marker and repeated excluded directory names:
 
 ```text
 meta<TAB>scan_policy<TAB>1
@@ -54,10 +54,10 @@ meta<TAB>exclude_name<TAB>node_modules
 
 - Marker with no exclusions means explicitly empty exclusions.
 - No marker means UNKNOWN policy, never an implicit empty policy.
-- Reject unsupported policy versions, malformed policy records, and conflicting markers for automatic startup.
+- `FileIndexStore::open` rejects unsupported versions, malformed policy records, duplicate markers, and exclusions without a marker as `InvalidData`. Explicit CLI `index` builds a fresh snapshot without reading the old one and can recover from invalid policy metadata.
 - New explicit `index` builds persist the chosen policy and an absolute canonical root.
 - Enabling automatic refresh on a legacy index requires an explicit rebuild using `index <root> <index-file> [--exclude-name ...]` with the intended scope. Do not guess the original exclusions or silently rewrite a relative root.
-- Upgraded daemon `refresh`, `reindex`, and `index_status` inherit a known stored policy when exclusions are omitted. Explicit exclusions must match it; a mismatch returns a scope error without scanning or writing. Changing policy requires an explicit CLI rebuild while no service owns the index.
+- CLI `refresh`/`status` and daemon `refresh`/`reindex`/`index_status` inherit a known stored policy when exclusions are omitted. Explicit exclusions must match it; a mismatch returns a scope error without scanning or writing. Changing policy requires an explicit CLI rebuild while no service owns the index.
 - For legacy manual operations, preserve the existing explicit/default exclusion behavior and root safety errors. Ordinary refresh does not mark an unknown policy as confirmed.
 - Older readers currently skip unknown metadata and can still query these files. Older writers drop the new metadata and do not honor writer locks; mixing versions as writers is unsupported. Missing policy on the next open must fail closed for automatic refresh.
 
